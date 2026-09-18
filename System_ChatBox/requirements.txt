@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
+sqlalchemy
+pymysql
+pandas
+sentence-transformers
+chromadb
+numpy

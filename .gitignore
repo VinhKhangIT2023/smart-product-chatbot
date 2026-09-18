@@ -1,0 +1,40 @@
+# ============================================================
+# .gitignore — đặt tại KLCN-HK1/ (thư mục gốc chứa Dataset/ và System_ChatBox/)
+# ============================================================
+
+# ---- Bí mật, KHÔNG bao giờ push (chứa mật khẩu MySQL + API key thật) ----
+System_ChatBox/.env
+.env
+*.env
+
+# ---- TOÀN BỘ Dataset/ — loại hẳn khỏi Git ----
+# Lý do: có ít nhất 2 file ~145MB (convrec_shopping_study.json,
+# convrec_shopping_cleaned.jsonl) VƯỢT giới hạn cứng 100MB/file của GitHub
+# -> push sẽ bị từ chối nếu không loại trừ. Ngoài ra đây là dữ liệu (không
+# phải code), Dataset1 là công của thành viên khác trong nhóm, và dữ liệu
+# có thể tái tạo lại bằng script (import_to_mysql.py, build_vector_index.py)
+# nên không cần lưu trong repo code.
+Dataset/
+
+# ---- Data sinh ra từ build_vector_index.py — tự tạo lại được ----
+System_ChatBox/chroma_db/
+chroma_db/
+
+# ---- Cache Python thông thường ----
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ---- Virtual environment (nếu tạo sau này) ----
+venv/
+env/
+*.egg-info/
+
+# ---- Cache model embedding (Hugging Face), nếu vô tình nằm trong project ----
+.cache/
+
+# ---- File tạm của hệ điều hành/editor ----
+.DS_Store
+Thumbs.db
+*.swp
