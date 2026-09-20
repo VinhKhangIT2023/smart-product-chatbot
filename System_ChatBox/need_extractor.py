@@ -43,10 +43,13 @@ QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen/qwen-turbo")
 _client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL) if (OpenAI and QWEN_API_KEY) else None
 
 # Khớp đúng ALL_SLOTS trong session_manager.py — sửa cả 2 nơi nếu đổi slot.
+# free_text: nơi chứa NGỮ CẢNH không khớp field cố định nào (vd "cho phòng khách",
+# "làm quà tặng tân gia") — dùng cho AI Matching (vector_search.py đọc field này để
+# xếp hạng ngữ nghĩa), KHÔNG dùng để lọc cứng SQL, KHÔNG bao giờ được hỏi trực tiếp.
 SLOT_SCHEMA_HINT = (
     '{"category": string|null, "price_range": "min-max"|null, '
     '"color": string|null, "material": string|null, "style": string|null, '
-    '"brand": string|null, "size_space": string|null}'
+    '"brand": string|null, "size_space": string|null, "free_text": string|null}'
 )
 
 EXTRACT_SYSTEM_PROMPT = (
@@ -55,9 +58,28 @@ EXTRACT_SYSTEM_PROMPT = (
     f"Schema bắt buộc: {SLOT_SCHEMA_HINT}. "
     "Chỉ điền trường nào user THỰC SỰ nhắc tới trong tin nhắn MỚI NHẤT; trường không nhắc tới "
     "để null (không suy diễn, không tự đặt giá trị mặc định). "
+    "QUAN TRỌNG: category CHỈ chứa đúng tên loại sản phẩm (vd 'thảm trải sàn'), KHÔNG được ghép "
+    "thêm ngữ cảnh sử dụng/không gian đặt vào category. "
+    "Phân biệt size_space và free_text: nếu nhắc tên không gian KÈM số đo/diện tích cụ thể "
+    "(vd 'phòng khách rộng 20m2', 'bàn dài 1m2') -> size_space. Nếu CHỈ nhắc tên không gian/mục "
+    "đích mà KHÔNG có số đo (vd 'cho phòng khách', 'làm quà tặng', 'dùng mùa đông') -> free_text. "
     "price_range chỉ điền khi user nêu rõ số tiền/khoảng giá, viết dạng 'min-max' bằng số "
     "(ví dụ user nói 'dưới 500k' -> '0-500000'; 'khoảng 200-300k' -> '200000-300000')."
 )
+
+# Few-shot: ví dụ mẫu cụ thể input -> output JSON, giúp Qwen bắt đúng pattern
+# thay vì chỉ dựa vào mô tả trừu tượng — đặc biệt quan trọng để phân biệt
+# category/free_text/size_space qua nhiều kiểu câu đa dạng (không chỉ 1 mẫu).
+EXTRACT_FEWSHOT = [
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Tôi muốn mua thảm trải sàn phòng khách"'},
+    {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "free_text": "phòng khách"}'},
+
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Ghế sofa êm cho phòng khách rộng khoảng 20m2"'},
+    {"role": "assistant", "content": '{"category": "ghế sofa", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng khách khoảng 20m2", "free_text": null}'},
+
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Mua bộ dao làm quà tặng sinh nhật bạn, tầm 300k"'},
+    {"role": "assistant", "content": '{"category": "bộ dao", "price_range": "0-300000", "color": null, "material": null, "style": null, "brand": null, "size_space": null, "free_text": "quà tặng sinh nhật"}'},
+]
 
 
 def _build_context_note(current_slots: Dict[str, Any]) -> str:
@@ -83,6 +105,7 @@ def extract_slots(
     current_slots = current_slots or {}
     messages = [
         {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+        *EXTRACT_FEWSHOT,
         {"role": "user", "content": f"{_build_context_note(current_slots)}\n\nTin nhắn mới của user: \"{user_message}\""},
     ]
 

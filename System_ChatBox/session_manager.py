@@ -37,7 +37,12 @@ REQUIRED_HARD_SLOTS = ["category", "size_space"]
 PRIORITY_SOFT_SLOTS = ["price_range"]
 OPTIONAL_SOFT_SLOTS = ["color", "material", "style", "brand"]
 
-ALL_SLOTS = REQUIRED_HARD_SLOTS + PRIORITY_SOFT_SLOTS + OPTIONAL_SOFT_SLOTS
+# Slot "chứa ngữ cảnh" — KHÔNG bao giờ được hỏi trực tiếp (không xuất hiện trong bất
+# kỳ vòng lặp ASK_HARD_SLOT/ASK_SOFT_SLOT nào), chỉ lưu lại để vector_search.py dùng
+# cho AI Matching (vd: "cho phòng khách", "làm quà tặng tân gia").
+PASSTHROUGH_SLOTS = ["free_text"]
+
+ALL_SLOTS = REQUIRED_HARD_SLOTS + PRIORITY_SOFT_SLOTS + OPTIONAL_SOFT_SLOTS + PASSTHROUGH_SLOTS
 
 # Số soft slot tối đa hỏi thêm trong 1 phiên trước khi ép chuyển sang
 # SEARCH_PRODUCTS, để tránh hỏi dồn quá nhiều lượt (theo insight Bộ 2:

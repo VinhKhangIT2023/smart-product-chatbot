@@ -154,8 +154,35 @@ def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, 
 # là stub cắt thô top_k như trước.
 
 
+def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
+    """Truy vấn giá MIN/MAX/trung vị của các sản phẩm cùng category — dùng để
+    GỢI Ý khoảng giá tham khảo cho user khi hỏi price_range, thay vì bắt user
+    tự đoán mù (đúng vấn đề: user không phải lúc nào cũng biết giá thị trường
+    của loại sản phẩm họ cần). Trả về None nếu chưa có category hoặc lỗi DB —
+    khi đó hệ thống vẫn hỏi giá bình thường, chỉ là không kèm gợi ý số liệu."""
+    if not category or not SQLALCHEMY_AVAILABLE:
+        return None
+    try:
+        engine = create_engine(DB_URL)
+        query = text(
+            f"SELECT MIN(price) AS min_p, MAX(price) AS max_p, AVG(price) AS avg_p "
+            f"FROM {PRODUCTS_TABLE} "
+            f"WHERE (main_category LIKE :cat OR leaf_category LIKE :cat) AND price > 0"
+        )
+        with engine.connect() as conn:
+            row = conn.execute(query, {"cat": f"%{category}%"}).mappings().first()
+        if not row or row["min_p"] is None:
+            return None
+        return {"min": float(row["min_p"]), "max": float(row["max_p"]), "avg": float(row["avg_p"])}
+    except Exception as e:
+        print(f"[get_price_stats] Lỗi truy vấn: {e}")
+        return None
+
+
 # ---------- Mô-đun 4: Sinh phản hồi bằng Qwen, tuỳ theo action/slot ----------
-def build_action_instruction(action: NextAction, slot: Optional[str], top_products: List[Dict[str, Any]]) -> str:
+def build_action_instruction(
+    action: NextAction, slot: Optional[str], top_products: List[Dict[str, Any]], slots: Dict[str, Any]
+) -> str:
     """Tạo câu chỉ dẫn ngắn gắn kèm câu hỏi user, báo cho Qwen biết PHẢI làm
     gì ở lượt này — Qwen sẽ tự viết câu chữ tự nhiên theo đúng phong cách
     few-shot, không lặp lại máy móc."""
@@ -165,6 +192,15 @@ def build_action_instruction(action: NextAction, slot: Optional[str], top_produc
         return ("[Chỉ dẫn hệ thống: hãy hỏi user về kích thước/không gian sử dụng "
                 "(không ép phải có số đo chính xác, chấp nhận mô tả mơ hồ).]")
     if action == NextAction.ASK_SOFT_SLOT and slot == "price_range":
+        stats = get_price_stats(slots.get("category"))
+        if stats:
+            return (
+                f"[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn. "
+                f"Sản phẩm loại này trong hệ thống dao động từ {stats['min']:,.0f}đ đến "
+                f"{stats['max']:,.0f}đ (trung bình khoảng {stats['avg']:,.0f}đ) — hãy nêu "
+                f"khoảng giá này để gợi ý cho user tham khảo, vì user có thể chưa biết "
+                f"mức giá hợp lý của loại sản phẩm này.]"
+            )
         return "[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn.]"
     if action == NextAction.ASK_SOFT_SLOT and slot:
         return f"[Chỉ dẫn hệ thống: hãy hỏi user về thuộc tính '{slot}' (màu/chất liệu/phong cách/thương hiệu).]"
@@ -177,13 +213,14 @@ def build_action_instruction(action: NextAction, slot: Optional[str], top_produc
 
 
 def generate_llm_reply(
-    session_id: str, user_message: str, action: NextAction, slot: Optional[str], top_products: List[Dict[str, Any]]
+    session_id: str, user_message: str, action: NextAction, slot: Optional[str],
+    top_products: List[Dict[str, Any]], slots: Dict[str, Any]
 ) -> str:
     if qwen_client is None:
         return "[Chưa cấu hình QWEN_API_KEY trong .env nên chưa sinh được phản hồi tự nhiên.]"
 
     history = session_manager.get_history(session_id)
-    instruction = build_action_instruction(action, slot, top_products)
+    instruction = build_action_instruction(action, slot, top_products, slots)
     augmented_message = f"{user_message}\n{instruction}" if instruction else user_message
 
     messages = build_messages(
@@ -237,7 +274,7 @@ def chat(req: ChatRequest):
         top_products = semantic_rank(candidates, slots)
         session_manager.mark_as_shown(session.session_id, top_products)
 
-    reply = generate_llm_reply(session.session_id, req.message, action, slot, top_products)
+    reply = generate_llm_reply(session.session_id, req.message, action, slot, top_products, session_manager.get_slots(session.session_id))
     session_manager.add_message(session.session_id, "assistant", reply)
 
     return ChatResponse(
