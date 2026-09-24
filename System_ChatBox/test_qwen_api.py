@@ -66,7 +66,7 @@ def test_connection():
                 {"role": "system", "content": "Bạn là trợ lý tư vấn sản phẩm gia dụng, trả lời ngắn gọn bằng tiếng Việt."},
                 {"role": "user", "content": "Xin chào, bạn có thể giúp tôi tìm thảm trải phòng khách không?"},
             ],
-            max_tokens=200,
+            max_tokens=400,
             # 2 header này OpenRouter khuyến nghị gửi kèm (không bắt buộc để
             # chạy được, nhưng giúp app của bạn hiện đúng tên trên dashboard
             # OpenRouter và tránh bị hạ ưu tiên khi hệ thống đông tải).
@@ -74,11 +74,21 @@ def test_connection():
                 "HTTP-Referer": "https://github.com/",
                 "X-Title": "KLCN Chatbot Home&Kitchen",
             },
+            # Tắt "thinking/reasoning" — model free hay bật mặc định, dễ tốn hết
+            # max_tokens cho phần suy luận nội bộ trước khi kịp trả câu trả lời
+            # thật (content trả về None) — xem openrouter.ai/docs cho model hỗ trợ.
+            extra_body={"reasoning": {"enabled": False}},
         )
+        content = response.choices[0].message.content
+        if not content:
+            print("[CẢNH BÁO] Model trả về content rỗng/None.")
+            print("=> Có thể do 'thinking' vẫn tốn hết token dù đã set enabled=False (model không hỗ trợ tắt).")
+            print("   Thử tăng max_tokens lên cao hơn, hoặc đổi model khác.")
+            return
         print("Kết nối Qwen API (qua OpenRouter) THÀNH CÔNG.")
         print("Model:", MODEL)
         print("Phản hồi mẫu:")
-        print(response.choices[0].message.content)
+        print(content)
     except Exception as e:
         print("[Lỗi gọi Qwen API]:", e)
         print("=> Kiểm tra lại: API key đúng chưa? Đúng model chưa (phải có hậu tố ':free')?")

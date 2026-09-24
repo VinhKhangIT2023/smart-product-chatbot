@@ -233,13 +233,20 @@ def generate_llm_reply(
         response = qwen_client.chat.completions.create(
             model=QWEN_MODEL,
             messages=messages,
-            max_tokens=400,
+            max_tokens=600,  # tăng từ 400 -> 600, chừa chỗ nếu provider tính cả token "suy nghĩ" vào đây
             extra_headers={  # OpenRouter khuyến nghị — vô hại nếu đổi sang Alibaba
                 "HTTP-Referer": "https://github.com/",
                 "X-Title": "KLCN Chatbot Home&Kitchen",
             },
+            extra_body={"reasoning": {"enabled": False}},  # tắt "thinking" — tránh model tốn hết
+            # max_tokens cho suy luận nội bộ mà chưa kịp viết câu trả lời thật (content = None)
         )
-        return response.choices[0].message.content
+        content = response.choices[0].message.content
+        if not content:
+            print("[generate_llm_reply] Model trả về content rỗng/None — dùng câu trả lời dự phòng.")
+            return ("Xin lỗi, hệ thống tư vấn đang bận xử lý, bạn vui lòng nhắn lại câu hỏi "
+                    "hoặc thử lại sau giây lát nhé.")
+        return content
     except Exception as e:
         return f"[Lỗi gọi Qwen API: {e}]"
 

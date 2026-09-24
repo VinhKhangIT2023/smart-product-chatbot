@@ -113,11 +113,17 @@ def extract_slots(
         response = _client.chat.completions.create(
             model=QWEN_MODEL,
             messages=messages,
-            max_tokens=200,
+            max_tokens=500,  # tăng từ 200 -> 500, chừa chỗ nếu model có tốn ít token "suy nghĩ"
             temperature=0,  # cần ổn định/xác định cho tác vụ trích xuất, không cần sáng tạo
             extra_headers={"HTTP-Referer": "https://github.com/", "X-Title": "KLCN Chatbot Home&Kitchen"},
+            extra_body={"reasoning": {"enabled": False}},  # tắt "thinking" — model free hay bật mặc định,
+            # dễ tốn hết max_tokens cho phần suy luận nội bộ trước khi kịp trả JSON thật (content = None)
         )
-        raw = response.choices[0].message.content.strip()
+        raw = response.choices[0].message.content
+        if not raw:
+            print("[need_extractor] Model trả về content rỗng/None (có thể do 'thinking' tốn hết token) — bỏ qua lượt này.")
+            return {}
+        raw = raw.strip()
     except Exception as e:
         print(f"[need_extractor] Lỗi gọi Qwen: {e}")
         return {}
