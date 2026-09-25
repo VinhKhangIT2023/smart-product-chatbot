@@ -5,17 +5,25 @@ File chạy chính — FastAPI backend ghép các mô-đun (đúng Bảng 3.1 kh
      hành động mỗi lượt: ASK_HARD_SLOT / ASK_SOFT_SLOT / SEARCH_PRODUCTS / END_SESSION
   2. need_extractor.py    -> NeedExtractor: trích xuất/cập nhật slot nhu cầu
      từ tin nhắn user (gọi Qwen riêng, tách khỏi bước sinh câu trả lời)
-  3. rule_based_filter()  -> RecommendationService tầng 1: lọc cứng bằng SQL
-     trên bảng `products` (MySQL, đã import 15.714 sản phẩm)
-  4. vector_search.py     -> RecommendationService tầng 2 (AI Matching):
+  3. category_mapper.py / color_mapper.py -> lớp DỊCH thuộc tính tiếng Việt
+     (do NeedExtractor trích xuất) sang giá trị tiếng Anh THẬT đang tồn tại
+     trong catalog, TRƯỚC KHI đưa vào rule_based_filter(). Đây là phần MỚI
+     THÊM để sửa lỗi đã phát hiện: catalog là dữ liệu Amazon tiếng Anh, còn
+     few-shot của NeedExtractor dạy trích xuất tiếng Việt -> nếu lọc SQL
+     thẳng bằng câu tiếng Việt thì KHÔNG BAO GIỜ khớp -> luôn trả 0 sản phẩm.
+  4. rule_based_filter()  -> RecommendationService tầng 1: lọc cứng bằng SQL
+     trên bảng `products` (MySQL, đã import 15.714 sản phẩm), SAU KHI đã
+     dịch category/color qua category_mapper/color_mapper.
+  5. vector_search.py     -> RecommendationService tầng 2 (AI Matching):
      xếp hạng ngữ nghĩa trên tập đã lọc, đọc index Chroma đã build sẵn
      (xem build_vector_index.py — chạy 1 lần offline, KHÔNG chạy mỗi request)
-  5. few_shot_examples.py + Qwen API -> ResponseService: sinh câu trả lời
+  6. few_shot_examples.py + Qwen API -> ResponseService: sinh câu trả lời
      tự nhiên, tuỳ theo action/slot mà DialogueService quyết định
 
 CHẠY THỬ:
   pip install fastapi uvicorn python-dotenv openai sqlalchemy pymysql sentence-transformers chromadb
-  python build_vector_index.py   # chạy 1 lần trước, để có index cho AI Matching
+  python build_vector_index.py     # 1 lần, index sản phẩm cho AI Matching
+  python build_category_index.py   # 1 lần, index tên category cho category_mapper (MỚI)
   uvicorn main:app --reload
   Mở http://127.0.0.1:8000/docs để test qua Swagger UI.
 
@@ -44,6 +52,8 @@ from session_manager import SessionManager, NextAction
 from few_shot_examples import build_messages
 from need_extractor import extract_slots
 from vector_search import semantic_rank
+from category_mapper import resolve_leaf_categories
+from color_mapper import resolve_color
 
 # MySQL (optional import — API vẫn chạy được nếu chưa cài, chỉ rule_based_filter trả rỗng)
 try:
@@ -96,10 +106,24 @@ class ChatResponse(BaseModel):
 # ---------- Mô-đun 2: Rule-based lọc sản phẩm (MySQL) ----------
 def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, Any]]:
     """Lọc sản phẩm ứng viên theo các slot đã thu thập được.
-    Dùng đúng tên cột thật trong bảng `products`:
-      category  -> so khớp trên main_category HOẶC leaf_category
-      price_range -> khoảng "min-max" (chuỗi, vd "0-500000"), lọc trên price
-      color, brand -> so khớp LIKE
+
+    SỬA SO VỚI BẢN CŨ (lỗi 0 candidates đã phát hiện):
+      - category: KHÔNG còn LIKE trực tiếp câu tiếng Việt vào main_category/
+        leaf_category (catalog là tiếng Anh -> không bao giờ khớp). Thay
+        vào đó dùng category_mapper.resolve_leaf_categories() để tìm các
+        leaf_category TIẾNG ANH THẬT gần nghĩa nhất bằng vector similarity,
+        rồi lọc bằng `leaf_category IN (...)`.
+      - ĐÃ BỎ lọc theo main_category: kiểm tra DISTINCT thật cho thấy cột
+        này chỉ có đúng 1 giá trị "Home_and_Kitchen" cho toàn bộ catalog —
+        lọc theo nó không thu hẹp được gì, chỉ leaf_category mới có tác dụng.
+      - color: dùng color_mapper.resolve_color() để dịch màu tiếng Việt
+        sang tiếng Anh trước khi LIKE (color là soft slot — không map được
+        thì bỏ qua điều kiện, không suy đoán).
+      - Nếu category không map được leaf_category nào đủ tin cậy: KHÔNG áp
+        lọc cứng category (để AI Matching / free_text xử lý ở tầng 2), có
+        log cảnh báo rõ ràng — không tự nới các ràng buộc KHÁC (giá, brand)
+        để bù lại.
+
     Trả về [] nếu chưa cài sqlalchemy/pymysql hoặc MySQL chưa sẵn sàng.
     """
     if not SQLALCHEMY_AVAILABLE:
@@ -114,13 +138,30 @@ def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, 
     conditions = []
     params: Dict[str, Any] = {}
 
-    if slots.get("category"):
-        conditions.append("(main_category LIKE :category OR leaf_category LIKE :category)")
-        params["category"] = f"%{slots['category']}%"
+    category_text = slots.get("category")
+    if category_text:
+        matched_categories = resolve_leaf_categories(category_text)
+        if matched_categories:
+            placeholders = []
+            for i, cat in enumerate(matched_categories):
+                key = f"cat{i}"
+                placeholders.append(f":{key}")
+                params[key] = cat
+            conditions.append(f"leaf_category IN ({', '.join(placeholders)})")
+        else:
+            # Không map được category nào đủ tin cậy -> không lọc cứng theo
+            # category ở tầng SQL, nhưng vẫn giữ category_text để vector_search.py
+            # (build_query_text) có thể dùng làm tín hiệu ngữ nghĩa ở tầng 2.
+            print(f"[rule_based_filter] category='{category_text}' không map được "
+                  f"leaf_category nào -> bỏ qua lọc cứng category ở lượt này.")
 
-    if slots.get("color"):
-        conditions.append("color LIKE :color")
-        params["color"] = f"%{slots['color']}%"
+    color_text = slots.get("color")
+    if color_text:
+        color_en = resolve_color(color_text)
+        if color_en:
+            conditions.append("color LIKE :color")
+            params["color"] = f"%{color_en}%"
+        # Không map được màu -> bỏ qua điều kiện màu (soft slot, không suy đoán).
 
     if slots.get("brand"):
         conditions.append("brand LIKE :brand")
@@ -157,20 +198,32 @@ def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, 
 def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
     """Truy vấn giá MIN/MAX/trung vị của các sản phẩm cùng category — dùng để
     GỢI Ý khoảng giá tham khảo cho user khi hỏi price_range, thay vì bắt user
-    tự đoán mù (đúng vấn đề: user không phải lúc nào cũng biết giá thị trường
-    của loại sản phẩm họ cần). Trả về None nếu chưa có category hoặc lỗi DB —
-    khi đó hệ thống vẫn hỏi giá bình thường, chỉ là không kèm gợi ý số liệu."""
+    tự đoán mù giá.
+
+    SỬA: dùng category_mapper để dịch category tiếng Việt sang leaf_category
+    tiếng Anh thật trước khi query, giống rule_based_filter() (cùng 1 lỗi gốc,
+    cùng 1 cách sửa). Trả về None nếu chưa có category, không map được
+    leaf_category nào, hoặc lỗi DB — khi đó hệ thống vẫn hỏi giá bình thường,
+    chỉ là không kèm gợi ý số liệu."""
     if not category or not SQLALCHEMY_AVAILABLE:
         return None
+
+    matched_categories = resolve_leaf_categories(category)
+    if not matched_categories:
+        return None
+
     try:
         engine = create_engine(DB_URL)
+        placeholders = [f":cat{i}" for i in range(len(matched_categories))]
+        params = {f"cat{i}": cat for i, cat in enumerate(matched_categories)}
+        params["zero"] = 0
         query = text(
             f"SELECT MIN(price) AS min_p, MAX(price) AS max_p, AVG(price) AS avg_p "
             f"FROM {PRODUCTS_TABLE} "
-            f"WHERE (main_category LIKE :cat OR leaf_category LIKE :cat) AND price > 0"
+            f"WHERE leaf_category IN ({', '.join(placeholders)}) AND price > :zero"
         )
         with engine.connect() as conn:
-            row = conn.execute(query, {"cat": f"%{category}%"}).mappings().first()
+            row = conn.execute(query, params).mappings().first()
         if not row or row["min_p"] is None:
             return None
         return {"min": float(row["min_p"]), "max": float(row["max_p"]), "avg": float(row["avg_p"])}
