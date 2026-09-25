@@ -15,6 +15,17 @@ Chiến lược 2 tầng đã thống nhất trong khóa luận (mục 1.3.3, 3.
 Cách lấy lại vector theo ID (collection.get) thay vì query toàn bộ Chroma
 rồi lọc sau — vì tập ứng viên đã nhỏ (rule-based lọc trước), lấy đúng ID
 cần thiết sẽ nhanh và chính xác hơn dùng "where" filter phức tạp.
+
+--- MỚI THÊM: extra_signals (đúng Bảng 2.9 khóa luận — brand/color/material
+"chỉ lọc cứng khi bắt buộc") ---
+Từ khi main.py phân biệt hard_constraint (lọc cứng SQL) với ưu tiên mềm cho
+color/brand (xem need_extractor.py, session_manager.py), những giá trị
+color/brand KHÔNG được lọc cứng ở tầng 1 cần một nơi khác để vẫn có ảnh
+hưởng tới kết quả — đó là TẦNG 2 này, qua tham số extra_signals: main.py
+truyền vào các giá trị color/brand đang ở chế độ "ưu tiên mềm" (chưa bị lọc
+SQL), build_query_text() sẽ ghép chúng vào câu truy vấn ngữ nghĩa, giúp sản
+phẩm có màu/thương hiệu gần đúng được XẾP HẠNG cao hơn, dù không bị LOẠI
+nếu thiếu.
 """
 
 import os
@@ -78,17 +89,23 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom) if denom else 0.0
 
 
-def build_query_text(slots: Dict[str, Any]) -> str:
+def build_query_text(slots: Dict[str, Any], extra_signals: Optional[List[str]] = None) -> str:
     """Ghép các slot mềm (không phải ràng buộc cứng đã lọc SQL rồi) thành
     1 câu mô tả nhu cầu, dùng làm query cho vector search — chỉ nên đưa
     các thuộc tính NGỮ NGHĨA mơ hồ (style, material, free_text), vì
-    category/price/color/brand đã được rule_based_filter xử lý chính xác
-    ở tầng 1 rồi, không cần lặp lại ở đây."""
+    category/price đã được rule_based_filter xử lý chính xác ở tầng 1 rồi
+    (LUÔN hard), không cần lặp lại ở đây.
+
+    extra_signals (MỚI): các giá trị color/brand đang ở chế độ ƯU TIÊN MỀM
+    (KHÔNG bị lọc cứng SQL ở lượt này — xem main.py) — main.py tự quyết định
+    và truyền vào đây, module này không tự biết field nào đã hard/soft."""
     parts = []
     for key in ("style", "material", "free_text"):
         value = slots.get(key)
         if value:
             parts.append(str(value))
+    if extra_signals:
+        parts.extend(str(s) for s in extra_signals if s)
     return " ".join(parts) if parts else (slots.get("category") or "")
 
 
@@ -97,10 +114,12 @@ def semantic_rank(
     slots: Dict[str, Any],
     top_k: int = 5,
     id_field: str = "product_id",
+    extra_signals: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Xếp hạng lại `candidates` (đã qua rule_based_filter) theo độ phù hợp
-    ngữ nghĩa với nhu cầu trong `slots`. Trả về top_k dict gốc từ
-    `candidates`, có gắn thêm khoá "_similarity_score" để tham khảo/log.
+    ngữ nghĩa với nhu cầu trong `slots` (+ extra_signals nếu có — xem
+    build_query_text). Trả về top_k dict gốc từ `candidates`, có gắn thêm
+    khoá "_similarity_score" để tham khảo/log.
     Nếu index chưa sẵn sàng, fallback: trả về top_k đầu tiên không đổi
     thứ tự (KHÔNG báo lỗi/crash toàn hệ thống — đúng nguyên tắc "không
     khẳng định đã chạy AI Matching khi chưa có vector hợp lệ", mục 3.5.3
@@ -111,7 +130,7 @@ def semantic_rank(
     if not _lazy_init():
         return candidates[:top_k]
 
-    query_text = build_query_text(slots)
+    query_text = build_query_text(slots, extra_signals)
     if not query_text.strip():
         return candidates[:top_k]
 
@@ -153,3 +172,4 @@ if __name__ == "__main__":
     ]
     demo_slots = {"style": "tối giản, họa tiết hình học"}
     print(semantic_rank(demo_candidates, demo_slots))
+    print(semantic_rank(demo_candidates, demo_slots, extra_signals=["xanh dương"]))

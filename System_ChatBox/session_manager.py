@@ -22,6 +22,22 @@ PRIORITY_SOFT_SLOTS = ["price_range"] — hỏi trước các soft slot khác
 OPTIONAL_SOFT_SLOTS = ["color", "material", "style", "brand"] — hỏi
   dần dần theo turn, không hỏi dồn hết 1 lúc.
 
+--- MỚI THÊM: hard_constraint_slots (đúng Bảng 2.9 khóa luận) ---
+Lưu ý: tên "OPTIONAL_SOFT_SLOTS" ở đây nói về việc THU THẬP (có bắt buộc
+PHẢI HỎI hay không) — KHÁC với khái niệm "hard_constraints" mới thêm, nói
+về việc SAU KHI ĐÃ CÓ GIÁ TRỊ rồi thì LỌC CỨNG hay chỉ dùng ƯU TIÊN MỀM khi
+xếp hạng. Hai khái niệm độc lập: color/brand vẫn là "optional để hỏi" (có
+thể không hỏi, không bắt buộc phải thu thập), nhưng MỘT KHI user đã cho
+giá trị VÀ nói rõ là bắt buộc (hard_constraint_slots), thì giá trị đó phải
+được lọc cứng, không được bỏ sản phẩm thiếu dữ liệu vào danh sách gợi ý.
+
+hard_constraint_slots CHỈ chứa "color" và/hoặc "brand" (khớp đúng
+need_extractor.ALLOWED_HARD_CONSTRAINT_FIELDS — sửa cả 2 nơi nếu mở rộng).
+TÍCH LŨY qua các lượt (giống cách xử lý slots khác trong file này): một khi
+user đã nói rõ bắt buộc thì giữ nguyên bắt buộc tới hết phiên. CHƯA cài đặt
+cơ chế "hạ cấp" (user nói lại "thôi không cần bắt buộc nữa") — nhóm cân
+nhắc bổ sung sau nếu thấy cần thiết qua thực nghiệm.
+
 File này KHÔNG cần đăng nhập/API key gì cả — chạy độc lập được ngay.
 """
 
@@ -43,6 +59,12 @@ OPTIONAL_SOFT_SLOTS = ["color", "material", "style", "brand"]
 PASSTHROUGH_SLOTS = ["free_text"]
 
 ALL_SLOTS = REQUIRED_HARD_SLOTS + PRIORITY_SOFT_SLOTS + OPTIONAL_SOFT_SLOTS + PASSTHROUGH_SLOTS
+
+# Các field ĐƯỢC PHÉP đánh dấu là "bắt buộc lọc cứng" (hard_constraint) —
+# PHẢI khớp đúng need_extractor.ALLOWED_HARD_CONSTRAINT_FIELDS. Chỉ áp dụng
+# cho color/brand (xem giải thích chi tiết ở docstring đầu file và ở
+# need_extractor.py).
+ALLOWED_HARD_CONSTRAINT_FIELDS = {"color", "brand"}
 
 # Số soft slot tối đa hỏi thêm trong 1 phiên trước khi ép chuyển sang
 # SEARCH_PRODUCTS, để tránh hỏi dồn quá nhiều lượt (theo insight Bộ 2:
@@ -78,6 +100,11 @@ class SessionState:
     soft_slots_asked: int = 0             # đếm số soft slot đã hỏi (để chặn hỏi quá nhiều)
     asked_slots: Set[str] = field(default_factory=set)  # slot nào đã từng hỏi rồi thì không hỏi lại
 
+    # MỚI: các field mà user đã nói RÕ là bắt buộc (subset của color/brand) —
+    # xem ALLOWED_HARD_CONSTRAINT_FIELDS. Rỗng = mặc định mọi giá trị color/
+    # brand hiện có đều chỉ là ƯU TIÊN MỀM (dùng xếp hạng, không lọc cứng).
+    hard_constraint_slots: Set[str] = field(default_factory=set)
+
     # Chống lặp gợi ý sản phẩm giữa các turn
     shown_product_ids: Set[str] = field(default_factory=set)
 
@@ -87,6 +114,7 @@ class SessionState:
         d = self.__dict__.copy()
         d["shown_product_ids"] = list(self.shown_product_ids)
         d["asked_slots"] = list(self.asked_slots)
+        d["hard_constraint_slots"] = list(self.hard_constraint_slots)
         return d
 
 
@@ -129,7 +157,11 @@ class SessionManager:
     # ---------- Cập nhật slot nhu cầu ----------
     def update_slots(self, session_id: str, new_values: Dict[str, Any]) -> SessionState:
         """Ghi đè/bổ sung slot mới trích xuất được từ tin nhắn user.
-        Giá trị None bị bỏ qua (không xoá nhu cầu đã thu thập trước đó)."""
+        Giá trị None bị bỏ qua (không xoá nhu cầu đã thu thập trước đó).
+        LƯU Ý: chỉ nhận key nằm trong ALL_SLOTS — key "hard_constraints" (nếu
+        có trong dict từ need_extractor.extract_slots()) sẽ bị BỎ QUA ở đây,
+        nơi gọi hàm này (main.py) phải tự tách ra và gọi update_hard_constraints()
+        riêng."""
         session = self.get_or_create(session_id)
         for key, value in new_values.items():
             if key not in ALL_SLOTS:
@@ -146,6 +178,25 @@ class SessionManager:
         này chỉ cần đã-hỏi để coi là resolved, không ép có số đo."""
         session = self.get_or_create(session_id)
         session.size_space_asked = True
+
+    # ---------- MỚI: quản lý hard_constraint_slots (bắt buộc vs ưu tiên) ----------
+    def update_hard_constraints(self, session_id: str, new_hard_fields: List[str]) -> SessionState:
+        """Đánh dấu các field (chỉ color/brand) mà user đã nói RÕ là bắt buộc
+        trong lượt mới nhất. TÍCH LŨY qua các lượt (một khi đã bắt buộc thì
+        giữ bắt buộc tới hết phiên — xem giới hạn đã ghi ở docstring đầu
+        file). Bỏ qua im lặng field nào không hợp lệ (không tin tưởng mù
+        quáng input từ ngoài, dù input này thực chất đã được need_extractor
+        lọc trước rồi — lọc lại ở đây cho chắc, phòng thủ 2 lớp)."""
+        session = self.get_or_create(session_id)
+        for field_name in new_hard_fields:
+            if field_name in ALLOWED_HARD_CONSTRAINT_FIELDS:
+                session.hard_constraint_slots.add(field_name)
+        session.updated_at = time.time()
+        return session
+
+    def get_hard_constraints(self, session_id: str) -> Set[str]:
+        session = self.get_session(session_id)
+        return session.hard_constraint_slots if session else set()
 
     # ---------- Chống lặp gợi ý ----------
     def filter_out_already_shown(
@@ -240,3 +291,11 @@ if __name__ == "__main__":
     print("Turn 3 ->", action)  # kỳ vọng: ASK_SOFT_SLOT / color (do soft_slots_asked=1 < 2)
 
     print("Slots hiện tại:", sm.get_slots(s.session_id))
+
+    # Demo MỚI — hard_constraints
+    sm.update_slots(s.session_id, {"color": "xanh"})
+    print("Trước khi đánh dấu bắt buộc:", sm.get_hard_constraints(s.session_id))  # set() rỗng
+    sm.update_hard_constraints(s.session_id, ["color"])
+    print("Sau khi đánh dấu bắt buộc color:", sm.get_hard_constraints(s.session_id))  # {"color"}
+    sm.update_hard_constraints(s.session_id, ["material"])  # "material" không hợp lệ -> bị bỏ qua
+    print("Thử thêm field không hợp lệ (material):", sm.get_hard_constraints(s.session_id))  # vẫn {"color"}

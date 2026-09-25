@@ -2,28 +2,31 @@
 main.py
 File chạy chính — FastAPI backend ghép các mô-đun (đúng Bảng 3.1 khóa luận):
   1. session_manager.py  -> DialogueService: decide_next_action() quyết định
-     hành động mỗi lượt: ASK_HARD_SLOT / ASK_SOFT_SLOT / SEARCH_PRODUCTS / END_SESSION
+     hành động mỗi lượt: ASK_HARD_SLOT / ASK_SOFT_SLOT / SEARCH_PRODUCTS / END_SESSION.
+     MỚI: cũng lưu hard_constraint_slots (color/brand nào user nói RÕ là bắt buộc).
   2. need_extractor.py    -> NeedExtractor: trích xuất/cập nhật slot nhu cầu
-     từ tin nhắn user (gọi Qwen riêng, tách khỏi bước sinh câu trả lời)
+     từ tin nhắn user (gọi Qwen riêng, tách khỏi bước sinh câu trả lời).
+     MỚI: cũng trích "hard_constraints" (đúng Bảng 2.9 khóa luận).
   3. category_mapper.py / color_mapper.py -> lớp DỊCH thuộc tính tiếng Việt
      (do NeedExtractor trích xuất) sang giá trị tiếng Anh THẬT đang tồn tại
-     trong catalog, TRƯỚC KHI đưa vào rule_based_filter(). Đây là phần MỚI
-     THÊM để sửa lỗi đã phát hiện: catalog là dữ liệu Amazon tiếng Anh, còn
-     few-shot của NeedExtractor dạy trích xuất tiếng Việt -> nếu lọc SQL
-     thẳng bằng câu tiếng Việt thì KHÔNG BAO GIỜ khớp -> luôn trả 0 sản phẩm.
+     trong catalog, TRƯỚC KHI đưa vào rule_based_filter().
   4. rule_based_filter()  -> RecommendationService tầng 1: lọc cứng bằng SQL
-     trên bảng `products` (MySQL, đã import 15.714 sản phẩm), SAU KHI đã
-     dịch category/color qua category_mapper/color_mapper.
+     trên bảng `products` (MySQL, đã import 15.714 sản phẩm).
+     MỚI: category/size_space/price_range LUÔN lọc cứng như cũ; nhưng
+     color/brand CHỈ lọc cứng nếu nằm trong hard_constraint_slots của phiên
+     (đúng Bảng 2.9: "chỉ lọc cứng khi người dùng yêu cầu bắt buộc") — nếu
+     không, để dành cho tầng 2 xử lý như ƯU TIÊN MỀM.
   5. vector_search.py     -> RecommendationService tầng 2 (AI Matching):
-     xếp hạng ngữ nghĩa trên tập đã lọc, đọc index Chroma đã build sẵn
-     (xem build_vector_index.py — chạy 1 lần offline, KHÔNG chạy mỗi request)
+     xếp hạng ngữ nghĩa trên tập đã lọc, đọc index Chroma đã build sẵn.
+     MỚI: nhận thêm extra_signals — color/brand đang ở chế độ ưu tiên mềm,
+     dùng để XẾP HẠNG (không loại bỏ) sản phẩm.
   6. few_shot_examples.py + Qwen API -> ResponseService: sinh câu trả lời
-     tự nhiên, tuỳ theo action/slot mà DialogueService quyết định
+     tự nhiên, tuỳ theo action/slot mà DialogueService quyết định.
 
 CHẠY THỬ:
   pip install fastapi uvicorn python-dotenv openai sqlalchemy pymysql sentence-transformers chromadb
   python build_vector_index.py     # 1 lần, index sản phẩm cho AI Matching
-  python build_category_index.py   # 1 lần, index tên category cho category_mapper (MỚI)
+  python build_category_index.py   # 1 lần, index tên category cho category_mapper
   uvicorn main:app --reload
   Mở http://127.0.0.1:8000/docs để test qua Swagger UI.
 
@@ -37,7 +40,7 @@ xong theo import_to_mysql.py (bảng `products`, khóa chính `product_id`).
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -104,28 +107,42 @@ class ChatResponse(BaseModel):
 
 
 # ---------- Mô-đun 2: Rule-based lọc sản phẩm (MySQL) ----------
-def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, Any]]:
+def rule_based_filter(
+    slots: Dict[str, Any],
+    hard_constraint_slots: Optional[Set[str]] = None,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
     """Lọc sản phẩm ứng viên theo các slot đã thu thập được.
 
-    SỬA SO VỚI BẢN CŨ (lỗi 0 candidates đã phát hiện):
-      - category: KHÔNG còn LIKE trực tiếp câu tiếng Việt vào main_category/
-        leaf_category (catalog là tiếng Anh -> không bao giờ khớp). Thay
-        vào đó dùng category_mapper.resolve_leaf_categories() để tìm các
-        leaf_category TIẾNG ANH THẬT gần nghĩa nhất bằng vector similarity,
-        rồi lọc bằng `leaf_category IN (...)`.
-      - ĐÃ BỎ lọc theo main_category: kiểm tra DISTINCT thật cho thấy cột
-        này chỉ có đúng 1 giá trị "Home_and_Kitchen" cho toàn bộ catalog —
-        lọc theo nó không thu hẹp được gì, chỉ leaf_category mới có tác dụng.
+    hard_constraint_slots: subset của {"color", "brand"} — các field mà user
+    đã nói RÕ là bắt buộc (xem session_manager.update_hard_constraints()).
+    None/rỗng nghĩa là color/brand hiện có (nếu có) đều chỉ là ƯU TIÊN MỀM,
+    KHÔNG lọc cứng SQL — đúng Bảng 2.9 khóa luận.
+
+    Đã sửa (lỗi lệch ngôn ngữ VI/EN đã phát hiện):
+      - category: dùng category_mapper.resolve_leaf_categories() (vector
+        similarity) thay vì LIKE trực tiếp câu tiếng Việt -> leaf_category
+        IN (...). ĐÃ BỎ lọc theo main_category (kiểm tra thật: chỉ có đúng
+        1 giá trị "Home_and_Kitchen" cho toàn catalog, không có tác dụng).
       - color: dùng color_mapper.resolve_color() để dịch màu tiếng Việt
-        sang tiếng Anh trước khi LIKE (color là soft slot — không map được
-        thì bỏ qua điều kiện, không suy đoán).
-      - Nếu category không map được leaf_category nào đủ tin cậy: KHÔNG áp
-        lọc cứng category (để AI Matching / free_text xử lý ở tầng 2), có
-        log cảnh báo rõ ràng — không tự nới các ràng buộc KHÁC (giá, brand)
-        để bù lại.
+        sang tiếng Anh trước khi so khớp.
+
+    MỚI (hard/soft cho color, brand):
+      - Nếu color/brand có giá trị NHƯNG KHÔNG nằm trong hard_constraint_slots
+        -> KHÔNG lọc cứng SQL (để tầng 2 vector_search dùng làm ưu tiên mềm).
+      - Nếu color/brand nằm trong hard_constraint_slots (user nói bắt buộc)
+        NHƯNG không dịch/khớp được (vd color không có trong color_mapper)
+        -> trả về [] NGAY (0 candidates), KHÔNG bỏ qua điều kiện — đúng
+        nguyên tắc "không tự nới ràng buộc bắt buộc" (mục 3.4.1 khóa luận).
+        Đây là hành vi CHỦ ĐÍCH, không phải bug — khác với category (luôn
+        bắt buộc theo cấu trúc, không có khái niệm "ưu tiên mềm" để category
+        rơi vào, nên category không dịch được thì fallback bỏ lọc, xem
+        category_mapper.py để biết lý do khác biệt này).
 
     Trả về [] nếu chưa cài sqlalchemy/pymysql hoặc MySQL chưa sẵn sàng.
     """
+    hard_constraint_slots = hard_constraint_slots or set()
+
     if not SQLALCHEMY_AVAILABLE:
         return []
 
@@ -149,23 +166,30 @@ def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, 
                 params[key] = cat
             conditions.append(f"leaf_category IN ({', '.join(placeholders)})")
         else:
-            # Không map được category nào đủ tin cậy -> không lọc cứng theo
-            # category ở tầng SQL, nhưng vẫn giữ category_text để vector_search.py
-            # (build_query_text) có thể dùng làm tín hiệu ngữ nghĩa ở tầng 2.
             print(f"[rule_based_filter] category='{category_text}' không map được "
                   f"leaf_category nào -> bỏ qua lọc cứng category ở lượt này.")
 
     color_text = slots.get("color")
-    if color_text:
+    if color_text and "color" in hard_constraint_slots:
         color_en = resolve_color(color_text)
         if color_en:
             conditions.append("color LIKE :color")
             params["color"] = f"%{color_en}%"
-        # Không map được màu -> bỏ qua điều kiện màu (soft slot, không suy đoán).
+        else:
+            # Bắt buộc nhưng không dịch được -> trả 0 NGAY, không âm thầm
+            # bỏ ràng buộc (khác hẳn nhánh category ở trên, xem docstring).
+            print(f"[rule_based_filter] color='{color_text}' được yêu cầu BẮT BUỘC "
+                  f"nhưng không nhận diện được -> trả 0 sản phẩm (không tự nới "
+                  f"ràng buộc bắt buộc).")
+            return []
+    # color có giá trị nhưng KHÔNG bắt buộc -> cố tình KHÔNG thêm điều kiện
+    # SQL ở đây, để main.py truyền color_text vào extra_signals cho tầng 2.
 
-    if slots.get("brand"):
+    brand_text = slots.get("brand")
+    if brand_text and "brand" in hard_constraint_slots:
         conditions.append("brand LIKE :brand")
-        params["brand"] = f"%{slots['brand']}%"
+        params["brand"] = f"%{brand_text}%"
+    # brand có giá trị nhưng KHÔNG bắt buộc -> tương tự color, để tầng 2 xử lý.
 
     price_range = slots.get("price_range")
     if price_range and isinstance(price_range, str) and "-" in price_range:
@@ -190,21 +214,28 @@ def rule_based_filter(slots: Dict[str, Any], limit: int = 30) -> List[Dict[str, 
         return []
 
 
-# AI Matching (xếp hạng ngữ nghĩa Top-K) đã chuyển sang vector_search.semantic_rank()
-# — module riêng, đọc index Chroma đã build sẵn (build_vector_index.py), không còn
-# là stub cắt thô top_k như trước.
+def build_soft_signals(slots: Dict[str, Any], hard_constraint_slots: Set[str]) -> List[str]:
+    """MỚI: gom các giá trị color/brand hiện có NHƯNG KHÔNG nằm trong
+    hard_constraint_slots (tức không bị lọc cứng ở rule_based_filter) —
+    dùng làm tín hiệu ưu tiên mềm truyền vào vector_search.semantic_rank(),
+    để chúng vẫn ảnh hưởng tới XẾP HẠNG dù không LOẠI sản phẩm thiếu dữ liệu."""
+    signals = []
+    color_text = slots.get("color")
+    if color_text and "color" not in hard_constraint_slots:
+        signals.append(color_text)
+    brand_text = slots.get("brand")
+    if brand_text and "brand" not in hard_constraint_slots:
+        signals.append(brand_text)
+    return signals
 
 
 def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
     """Truy vấn giá MIN/MAX/trung vị của các sản phẩm cùng category — dùng để
     GỢI Ý khoảng giá tham khảo cho user khi hỏi price_range, thay vì bắt user
-    tự đoán mù giá.
-
-    SỬA: dùng category_mapper để dịch category tiếng Việt sang leaf_category
-    tiếng Anh thật trước khi query, giống rule_based_filter() (cùng 1 lỗi gốc,
-    cùng 1 cách sửa). Trả về None nếu chưa có category, không map được
-    leaf_category nào, hoặc lỗi DB — khi đó hệ thống vẫn hỏi giá bình thường,
-    chỉ là không kèm gợi ý số liệu."""
+    tự đoán mù giá. Dùng category_mapper để dịch category tiếng Việt sang
+    leaf_category tiếng Anh thật trước khi query (cùng lỗi gốc, cùng cách
+    sửa như rule_based_filter()). Trả về None nếu chưa có category, không
+    map được leaf_category nào, hoặc lỗi DB."""
     if not category or not SQLALCHEMY_AVAILABLE:
         return None
 
@@ -317,6 +348,13 @@ def chat(req: ChatRequest):
     # tách khỏi ResponseService — đúng Bảng 3.1 khóa luận).
     current_slots = session_manager.get_slots(session.session_id)
     new_slots = extract_slots(req.message, current_slots, session_manager.get_history(session.session_id))
+
+    # MỚI: tách "hard_constraints" ra riêng TRƯỚC khi gọi update_slots() —
+    # update_slots() sẽ tự bỏ qua key này vì không nằm trong ALL_SLOTS
+    # (xem session_manager.py), nên phải xử lý riêng ở đây.
+    hard_constraints_this_turn = new_slots.pop("hard_constraints", [])
+    if hard_constraints_this_turn:
+        session_manager.update_hard_constraints(session.session_id, hard_constraints_this_turn)
     if new_slots:
         session_manager.update_slots(session.session_id, new_slots)
 
@@ -329,9 +367,13 @@ def chat(req: ChatRequest):
     top_products: List[Dict[str, Any]] = []
     if action == NextAction.SEARCH_PRODUCTS:
         slots = session_manager.get_slots(session.session_id)
-        candidates = rule_based_filter(slots)
+        hard_constraints = session_manager.get_hard_constraints(session.session_id)
+
+        candidates = rule_based_filter(slots, hard_constraints)
         candidates = session_manager.filter_out_already_shown(session.session_id, candidates)
-        top_products = semantic_rank(candidates, slots)
+
+        soft_signals = build_soft_signals(slots, hard_constraints)
+        top_products = semantic_rank(candidates, slots, extra_signals=soft_signals)
         session_manager.mark_as_shown(session.session_id, top_products)
 
     reply = generate_llm_reply(session.session_id, req.message, action, slot, top_products, session_manager.get_slots(session.session_id))
