@@ -6,21 +6,21 @@ Backend chatbot tư vấn sản phẩm hội thoại, kiến trúc RAG kết h�
 
 ```
 System_ChatBox/
-├── .env.example            # Mẫu khai báo biến môi trường — copy thành .env rồi điền giá trị thật
+├── .env.example              # Mẫu khai báo biến môi trường — copy thành .env rồi điền giá trị thật
 ├── requirements.txt
-├── few_shot_examples.py    # Mẫu phong cách hội thoại cho Qwen
-├── session_manager.py      # DialogueService — quyết định hành động mỗi lượt chat
-├── need_extractor.py       # NeedExtractor — trích slot nhu cầu từ tin nhắn (gọi Qwen)
-├── category_mapper.py      # (MỚI) Dịch category tiếng Việt -> leaf_category tiếng Anh
-│                            #   thật trong catalog, bằng vector similarity (không gọi Qwen)
-├── color_mapper.py         # (MỚI) Dịch tên màu tiếng Việt -> tiếng Anh, bảng tĩnh
-├── import_to_mysql.py      # Nạp catalog sản phẩm (CSV) vào MySQL
-├── build_vector_index.py   # Mã hóa embedding_text sản phẩm -> Chroma (chạy 1 lần, offline)
-├── build_category_index.py # (MỚI) Mã hóa tên leaf_category -> Chroma riêng (chạy 1 lần,
-│                            #   offline) — nguồn dữ liệu cho category_mapper.py
-├── vector_search.py        # AI Matching — xếp hạng ngữ nghĩa trên Chroma (tầng 2)
-├── test_qwen_api.py        # Test kết nối Qwen API
-└── main.py                  # FastAPI backend chính (endpoint /chat) — dùng
+├── few_shot_examples.py      # Mẫu phong cách hội thoại cho Qwen
+├── session_manager.py        # DialogueService — quyết định hành động mỗi lượt chat
+├── need_extractor.py         # NeedExtractor — trích slot nhu cầu từ tin nhắn (gọi Qwen)
+├── category_mapper.py        # (MỚI) Dịch category tiếng Việt -> leaf_category tiếng Anh
+│                             #   thật trong catalog, bằng vector similarity (không gọi Qwen)
+├── color_mapper.py           # (MỚI) Dịch tên màu tiếng Anh -> tiếng Việt, bảng tĩnh
+├── import_to_mysql.py        # Nạp catalog sản phẩm (CSV) vào MySQL
+├── build_vector_index.py     # Mã hóa embedding_text sản phẩm -> Chroma (chạy 1 lần, offline)
+├── build_category_index.py   # (MỚI) Mã hóa tên leaf_category -> Chroma riêng (chạy 1 lần,
+│                             #   offline) — nguồn dữ liệu cho category_mapper.py
+├── vector_search.py          # AI Matching — xếp hạng ngữ nghĩa trên Chroma (tầng 2)
+├── test_qwen_api.py          # Test kết nối Qwen API
+└── main.py                   # FastAPI backend chính (endpoint /chat) — dùng
                               #   category_mapper/color_mapper trong rule_based_filter()
 ```
 
