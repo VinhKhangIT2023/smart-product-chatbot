@@ -173,8 +173,17 @@ def rule_based_filter(
     if color_text and "color" in hard_constraint_slots:
         color_en = resolve_color(color_text)
         if color_en:
-            conditions.append("color LIKE :color")
-            params["color"] = f"%{color_en}%"
+            # Dataset v3: cột `color` có thể chứa NHIỀU giá trị ghép bằng
+            # " | " (vd "Black | Gold" cho sản phẩm 2 màu). Dùng LIKE '%X%'
+            # đơn giản sẽ khớp NHẦM (vd tìm "Gold" sẽ lọt luôn cả "Rose Gold"
+            # dù không có "Gold" đứng riêng). Kỹ thuật bọc dấu phân cách ở cả
+            # 2 đầu — CONCAT(' | ', color, ' | ') rồi so khớp '% | X | %' —
+            # đảm bảo chỉ khớp đúng NGUYÊN 1 giá trị trong danh sách, dùng
+            # được cho cả dòng 1 màu lẫn nhiều màu, không cần đổi schema.
+            # (NULL color của các dòng needs_review/missing/non_color tự
+            # động bị loại vì CONCAT(..., NULL, ...) = NULL trong MySQL.)
+            conditions.append("CONCAT(' | ', color, ' | ') LIKE :color")
+            params["color"] = f"% | {color_en} | %"
         else:
             # Bắt buộc nhưng không dịch được -> trả 0 NGAY, không âm thầm
             # bỏ ràng buộc (khác hẳn nhánh category ở trên, xem docstring).

@@ -1,64 +1,90 @@
 """
 color_mapper.py
 Ánh xạ tên MÀU tiếng Việt (do NeedExtractor trích xuất) sang tiếng Anh để
-so khớp LIKE với cột `color` trong bảng `products` (dữ liệu gốc Amazon,
-tiếng Anh — cùng nguyên nhân lệch ngôn ngữ như category, nhưng miền giá trị
-nhỏ và tương đối cố định nên dùng bảng dịch tay thay vì vector index.
+so khớp với cột `color` trong bảng `products`.
 
-GHI CHÚ QUAN TRỌNG — giới hạn đã biết của dữ liệu (không thuộc phạm vi sửa
-bằng mô-đun này): kiểm tra DISTINCT color thật cho thấy cột `color` trong
-catalog Bộ 1 khá NHIỄU — lẫn nhiều giá trị KHÔNG PHẢI màu (vd "Grain Mill",
-"Round", "Spiderman", "Rosewood 3 in 1 Grill Brush", "Original Version"...),
-nhiều khả năng do lỗi ánh xạ cột lúc crawl/clean dữ liệu gốc (Data_Cleaning,
-Bộ 1 — nhóm khác xử lý). Việc dịch VI->EN ở đây CHỈ giải quyết được phần
-lệch ngôn ngữ, KHÔNG giải quyết được phần nhiễu dữ liệu đó. Vì color là
-OPTIONAL_SOFT_SLOT (không bắt buộc), nhóm chấp nhận rủi ro recall thấp hơn
-mong muốn cho tiêu chí này, và nên ghi rõ giới hạn này khi viết mục hạn chế
-ở Chương 5 / phần "vấn đề kỹ thuật" của báo cáo.
+--- ĐÃ VIẾT LẠI HOÀN TOÀN (dataset v3) ---
+Bản trước dùng danh sách màu chuẩn TỰ ĐẶT (đoán từ khảo sát DISTINCT color
+thô). Từ dataset v3 (`Dataset1 Home & Kitchen 40k v3/Data_Cleaning/`), nhóm
+xử lý dữ liệu (Bộ 1) đã tự xây 1 pipeline làm sạch màu RIÊNG, bài bản hơn
+hẳn: mỗi sản phẩm có `color` (giá trị CHUẨN cuối cùng), `color_raw` (giá trị
+gốc), `colors_json` (mảng JSON các màu chuẩn), `color_status` (6 loại:
+recognized_single/multi/with_metadata, missing, non_color, needs_review),
+`color_rule`, `color_needs_review` (cờ 0/1).
 
-Dùng LIKE (không phải "="): để bắt được các giá trị ghép như
-"Black/Stainless Steel", "White/Yellow", "Brown and White" — vẫn coi là khớp
-nếu chứa đúng tên màu cần tìm.
+Cột `color` trong dataset v3 CHỈ CHỨA ĐÚNG 23 GIÁ TRỊ CHUẨN SAU (đã kiểm tra
+thật bằng cách tách toàn bộ giá trị `color`, kể cả các dòng đa màu ghép bằng
+" | "):
+  Beige, Black, Blue, Bronze, Brown, Clear, Copper, Cream, Gold, Gray,
+  Green, Ivory, Multicolor, Orange, Pink, Purple, Red, Rose Gold, Silver,
+  Teal, Turquoise, White, Yellow
+
+QUAN TRỌNG — khác biệt so với bản trước: pipeline của Bộ 1 CHỦ ĐÍCH coi
+"Stainless Steel", "Chrome", "Bamboo" là "non_color" (KHÔNG PHẢI màu, mà là
+chất liệu/hoàn thiện bề mặt) — ngược lại bản color_mapper.py TRƯỚC ĐÂY của
+module này từng tự thêm "Stainless Steel"/"Chrome"/"Brass" vào danh sách màu
+(SAI, đã sửa). Vì "Brass" không tồn tại trong 23 giá trị chuẩn thật, mọi
+input tiếng Việt liên quan kim loại giờ trỏ về "Copper" (đúng nghĩa "đồng")
+hoặc "Bronze" ("đồng thau") — 2 giá trị THẬT SỰ có trong dữ liệu, thay vì
+"Brass" (không tồn tại, dịch xong cũng không bao giờ khớp được sản phẩm nào).
+
+ĐA MÀU: nhiều sản phẩm có `color` dạng ghép " | " (vd "Black | Gold") — hàm
+resolve_color() ở đây CHỈ trả về 1 tên chuẩn duy nhất (đúng như trước), việc
+so khớp AN TOÀN với cả giá trị đơn lẫn giá trị ghép được xử lý ở main.py
+(rule_based_filter dùng CONCAT(' | ', color, ' | ') LIKE '% | X | %' — KHÔNG
+dùng LIKE '%X%' đơn giản, để tránh khớp nhầm substring, vd tìm "Gold" đơn
+thuần không được lọt vào "Rose Gold").
+
+GHI CHÚ VỀ needs_review: cột `color` trong dataset v3 đã TỰ NULL HÓA cho mọi
+dòng ở trạng thái needs_review/missing/non_color — tức khi lọc SQL theo
+`color`, các dòng này TỰ ĐỘNG bị loại (NULL không bao giờ khớp LIKE), KHÔNG
+cần xử lý gì thêm ở tầng ứng dụng cho việc này.
 """
 
 import re
 import unicodedata
 from typing import Optional
 
-# Bảng dịch tay — chỉ các màu PHỔ BIẾN thật sự xuất hiện trong dữ liệu (đối
-# chiếu với DISTINCT color thật đã kiểm tra), sắp theo độ dài khoá giảm dần
-# để ưu tiên khớp cụm dài/cụ thể hơn trước (vd "xám đậm" nên khớp trước "xám"
-# nếu sau này bổ sung — hiện tại đã để sẵn cấu trúc cho việc mở rộng).
+# Bảng dịch tay VI -> EN, CHỈ trỏ tới các giá trị THẬT SỰ TỒN TẠI trong cột
+# `color` của dataset v3 (xem danh sách 23 giá trị ở docstring trên) — dịch
+# sang giá trị không tồn tại thì lọc SQL sẽ luôn ra 0 kết quả một cách vô ích.
 VI_TO_EN_COLOR = {
     "trắng": "White",
     "đen": "Black",
     "xám": "Gray",
-    "xám đậm": "Dark Gray",
     "bạc": "Silver",
     "vàng": "Yellow",
+    "vàng kim": "Gold",
+    "vàng hồng": "Rose Gold",
     "đỏ": "Red",
     "hồng": "Pink",
     "xanh dương": "Blue",
     "xanh da trời": "Blue",
     "xanh lá": "Green",
+    "xanh lục lam": "Teal",
+    "xanh mòng két": "Teal",
+    "xanh ngọc": "Turquoise",
+    "ngọc lam": "Turquoise",
     "nâu": "Brown",
-    "be": "Cream",
+    "be": "Beige",
     "kem": "Cream",
     "trong suốt": "Clear",
-    "trong": "Transparent",
-    "nhiều màu": "Multi",
+    "trong": "Clear",
+    "nhiều màu": "Multicolor",
     "đa sắc": "Multicolor",
-    "tự nhiên": "Natural",
-    "gỗ tự nhiên": "Natural Wood",
-    "hồng ngọc": "Ruby",
-    "đồng": "Brass",
-    "ngà": "ivory",
-    "hồng phấn": "Rose",
+    "ngà": "Ivory",
+    "ngà voi": "Ivory",
+    "đồng": "Copper",       # tiếng Việt "đồng" = kim loại đồng -> Copper (SỬA so với bản
+                             # trước, từng trỏ nhầm sang "Brass" — Brass không tồn tại
+                             # trong dữ liệu thật của dataset v3).
+    "đồng thau": "Bronze",  # phân biệt với "đồng" (Copper) — đồng thau/hợp kim -> Bronze.
+    "tím": "Purple",
+    "cam": "Orange",
 }
 
-# Sắp xếp khoá theo độ dài giảm dần MỘT LẦN khi import — để khi so khớp,
-# cụm dài/cụ thể hơn ("xám đậm") được kiểm tra trước cụm ngắn ("xám"),
-# tránh khớp nhầm sớm.
+# Sắp theo độ dài giảm dần — ưu tiên khớp cụm dài/cụ thể hơn trước (vd
+# "đồng thau" phải được kiểm tra TRƯỚC "đồng", nếu không "đồng" sẽ khớp
+# nhầm trước do là cụm con của "đồng thau").
 _SORTED_KEYS = sorted(VI_TO_EN_COLOR.keys(), key=len, reverse=True)
 
 
@@ -77,9 +103,10 @@ _NORMALIZED_SORTED_KEYS = sorted(_NORMALIZED_LOOKUP.keys(), key=len, reverse=Tru
 
 
 def resolve_color(vi_color_text: str) -> Optional[str]:
-    """Trả về từ khoá màu TIẾNG ANH tương ứng để dùng trong LIKE '%...%',
-    hoặc None nếu không nhận diện được (khi đó rule_based_filter nên BỎ QUA
-    điều kiện lọc màu — đúng tinh thần soft slot, không tự bịa/ép giá trị)."""
+    """Trả về 1 trong 23 giá trị màu CHUẨN thật sự tồn tại trong cột `color`
+    của dataset v3, hoặc None nếu không nhận diện được (khi đó rule_based_filter
+    nên BỎ QUA điều kiện lọc màu — đúng tinh thần soft slot, không tự bịa/ép
+    giá trị)."""
     if not vi_color_text or not vi_color_text.strip():
         return None
 
@@ -91,7 +118,7 @@ def resolve_color(vi_color_text: str) -> Optional[str]:
 
     # Khớp theo cụm con — phòng trường hợp NeedExtractor trả về câu dài hơn
     # (vd "màu trắng" thay vì "trắng"). BẮT BUỘC dùng ranh giới từ (\b...\b),
-    # KHÔNG dùng "in" (substring thô) — đã phát hiện lỗi thật: "khong biet"
+    # KHÔNG dùng "in" (substring thô) — bản trước đã có lỗi thật: "khong biet"
     # bị khớp nhầm thành "hồng"/Pink vì chuỗi con "hong" nằm lọt trong "khong".
     for key in _NORMALIZED_SORTED_KEYS:
         if re.search(rf"\b{re.escape(key)}\b", normalized_input):
@@ -103,5 +130,6 @@ def resolve_color(vi_color_text: str) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    for demo in ["trắng", "màu đen", "Xám", "khong biet", "xanh dương nhạt"]:
+    for demo in ["trắng", "màu đen", "Xám", "khong biet", "xanh dương nhạt",
+                 "đồng", "đồng thau", "vàng hồng", "xanh ngọc"]:
         print(demo, "->", resolve_color(demo))

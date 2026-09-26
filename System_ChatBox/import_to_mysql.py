@@ -1,12 +1,13 @@
 ﻿"""
 import_to_mysql.py
-Nạp `amazon_home_kitchen_catalog_ready.csv` (Bộ 1, 15.714 sản phẩm, 23 cột)
-vào MySQL.
+Nạp catalog sản phẩm (CSV, do Bộ 1 xử lý) vào MySQL.
 
 Khác với cách làm "hard-code tên cột" thông thường: script này dùng
 pandas.to_sql để TỰ TẠO bảng `products` theo ĐÚNG cột thật có trong CSV
 (vì CSV do người phụ trách Bộ 1 xuất ra, cột có thể khác giữa các lần xử
-lý) — sau đó mới ALTER TABLE thêm khóa chính `product_id` + index cho
+lý — ví dụ bản v3 có thêm các cột color_raw/colors_json/color_status/
+color_rule/color_needs_review/image_url/... so với bản trước) — sau đó
+mới ALTER TABLE thêm khóa chính `product_id` + index cho
 `price`/`leaf_category`/`main_category`/`brand` bằng SQL thuần.
 
 Ngoài bảng `products`, script tạo thêm 2 bảng phụ dùng chung cho toàn hệ
@@ -16,18 +17,31 @@ thống:
   - evaluation_logs: log Precision@K + response time (Chức năng 4 —
     đánh giá hệ thống theo đề cương).
 
+--- ĐÃ SỬA: BỎ giá trị mặc định hard-code cho CATALOG_CSV_PATH ---
+Bản trước có 2 NƠI cùng giữ đường dẫn CSV: 1 giá trị mặc định hard-code
+ngay trong code (dùng khi .env không khai báo), và .env (ghi đè nếu có).
+Việc này từng gây nhầm lẫn thật: sửa .env tưởng đã trỏ đúng file mới,
+nhưng nếu quên/gõ sai TÊN BIẾN trong .env thì code ÂM THẦM rơi về path
+cũ hard-code sẵn (chỉ về đúng bộ dataset CŨ, không báo lỗi gì) — dễ khiến
+nhóm tưởng đã cập nhật dataset mới nhưng thực ra vẫn đang chạy trên dữ
+liệu cũ. Từ bản này, CATALOG_CSV_PATH BẮT BUỘC phải khai báo trong .env —
+KHÔNG có giá trị mặc định nào khác — nếu thiếu, script DỪNG NGAY và báo
+lỗi rõ ràng, thay vì âm thầm chạy sai dữ liệu.
+
 CHUẨN BỊ TRƯỚC KHI CHẠY (không liên quan Qwen, chỉ cần MySQL):
   1. Cài MySQL Server, tạo database:
        CREATE DATABASE klcn_chatbot CHARACTER SET utf8mb4;
   2. Cài thư viện:
        pip install pandas sqlalchemy pymysql python-dotenv
-  3. Tạo file .env cùng thư mục System_ChatBox/:
+  3. Tạo/sửa file .env cùng thư mục System_ChatBox/, BẮT BUỘC có đủ:
        DB_HOST=localhost
        DB_PORT=3306
        DB_USER=root
        DB_PASSWORD=your_password
        DB_NAME=klcn_chatbot
-  4. Sửa CATALOG_CSV_PATH bên dưới trỏ đúng file catalog_ready.csv thật.
+       CATALOG_CSV_PATH=đường dẫn thật tới file catalog CSV (vd
+         D:\\BaiTapVeNha\\KLCN-HK1\\Dataset\\Dataset1 Home & Kitchen 40k v3\\Data_Cleaning\\amazon_home_kitchen_catalog_ready.csv)
+     KHÔNG cần dấu ngoặc kép, không cần escape dấu \\ trong .env.
 
 File này KHÔNG cần Qwen API key.
 """
@@ -60,11 +74,10 @@ DB_NAME = os.getenv("DB_NAME", "klcn_chatbot")
 
 DB_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
 
-# Sửa đường dẫn này cho đúng file catalog_ready.csv thật của Bộ 1
-CATALOG_CSV_PATH = os.getenv(
-    "CATALOG_CSV_PATH",
-    "../Dataset/Dataset1 - Home & Kitchen 40k/Data_Cleaning/amazon_home_kitchen_catalog_ready.csv",
-)
+# BẮT BUỘC khai báo trong .env — KHÔNG có giá trị mặc định (xem giải thích
+# ở docstring đầu file). Thiếu biến này -> dừng ngay, báo lỗi rõ, không
+# đoán/rơi về path nào khác.
+CATALOG_CSV_PATH = os.getenv("CATALOG_CSV_PATH")
 
 PRODUCTS_TABLE = "products"
 PRIMARY_KEY_COL = "product_id"   # khóa chính thật (theo CSV thật: product_id, không phải parent_asin)
@@ -99,6 +112,17 @@ CREATE TABLE IF NOT EXISTS evaluation_logs (
 """
 
 
+def check_config():
+    """Kiểm tra CATALOG_CSV_PATH đã khai báo trong .env chưa — dừng ngay
+    kèm hướng dẫn rõ ràng nếu thiếu, KHÔNG âm thầm chạy với path đoán mò."""
+    if not CATALOG_CSV_PATH:
+        print("[LỖI] Chưa khai báo CATALOG_CSV_PATH trong file .env.")
+        print("=> Mở .env (cùng thư mục System_ChatBox/), thêm dòng:")
+        print("   CATALOG_CSV_PATH=đường dẫn thật tới file catalog CSV")
+        print("   (không cần dấu ngoặc kép, không cần escape dấu \\ trong .env)")
+        sys.exit(1)
+
+
 def get_engine():
     try:
         engine = create_engine(DB_URL)
@@ -121,7 +145,7 @@ def ensure_auxiliary_tables(engine):
 def import_catalog(csv_path: str, if_exists: str = "replace", chunksize: int = 500):
     if not os.path.exists(csv_path):
         print(f"[Lỗi] Không tìm thấy file: {csv_path}")
-        print("=> Sửa CATALOG_CSV_PATH cho đúng đường dẫn catalog_ready.csv thật.")
+        print("=> Sửa CATALOG_CSV_PATH trong .env cho đúng đường dẫn catalog CSV thật.")
         return
 
     print(f"Đang đọc {csv_path} ...")
@@ -133,10 +157,10 @@ def import_catalog(csv_path: str, if_exists: str = "replace", chunksize: int = 5
         print(f"[Cảnh báo] Không thấy cột '{PRIMARY_KEY_COL}' trong CSV — "
               f"bảng sẽ được tạo KHÔNG có khóa chính tự nhiên, chỉ có id tự tăng.")
 
-    # details_json / embedding_text nếu là dict/list thì ép về string JSON
-    # để MySQL lưu được (cột JSON hoặc TEXT tuỳ pandas suy luận kiểu).
-    # Dùng json.dumps chuẩn của Python (KHÔNG dùng pd.io.json.ujson_dumps —
-    # API nội bộ này đã bị gỡ bỏ ở pandas 2.x, dễ crash nếu cột thực sự
+    # details_json / embedding_text / colors_json nếu là dict/list thì ép về
+    # string JSON để MySQL lưu được (cột JSON hoặc TEXT tuỳ pandas suy luận
+    # kiểu). Dùng json.dumps chuẩn của Python (KHÔNG dùng pd.io.json.ujson_dumps
+    # — API nội bộ này đã bị gỡ bỏ ở pandas 2.x, dễ crash nếu cột thực sự
     # chứa object dict/list thay vì chuỗi text như CSV thường có).
     for col in df.columns:
         if df[col].apply(lambda v: isinstance(v, (dict, list))).any():
@@ -183,4 +207,5 @@ def import_catalog(csv_path: str, if_exists: str = "replace", chunksize: int = 5
 
 
 if __name__ == "__main__":
+    check_config()
     import_catalog(CATALOG_CSV_PATH)
