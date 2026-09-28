@@ -40,6 +40,7 @@ xong theo import_to_mysql.py (bảng `products`, khóa chính `product_id`).
 """
 
 import os
+import json
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import FastAPI, HTTPException
@@ -57,6 +58,7 @@ from need_extractor import extract_slots
 from vector_search import semantic_rank
 from category_mapper import resolve_leaf_categories
 from color_mapper import resolve_color
+from currency import usd_to_vnd, vnd_to_usd, round_vnd, USD_TO_VND_RATE
 
 # MySQL (optional import — API vẫn chạy được nếu chưa cài, chỉ rule_based_filter trả rỗng)
 try:
@@ -173,17 +175,18 @@ def rule_based_filter(
     if color_text and "color" in hard_constraint_slots:
         color_en = resolve_color(color_text)
         if color_en:
-            # Dataset v3: cột `color` có thể chứa NHIỀU giá trị ghép bằng
-            # " | " (vd "Black | Gold" cho sản phẩm 2 màu). Dùng LIKE '%X%'
-            # đơn giản sẽ khớp NHẦM (vd tìm "Gold" sẽ lọt luôn cả "Rose Gold"
-            # dù không có "Gold" đứng riêng). Kỹ thuật bọc dấu phân cách ở cả
-            # 2 đầu — CONCAT(' | ', color, ' | ') rồi so khớp '% | X | %' —
-            # đảm bảo chỉ khớp đúng NGUYÊN 1 giá trị trong danh sách, dùng
-            # được cho cả dòng 1 màu lẫn nhiều màu, không cần đổi schema.
-            # (NULL color của các dòng needs_review/missing/non_color tự
-            # động bị loại vì CONCAT(..., NULL, ...) = NULL trong MySQL.)
-            conditions.append("CONCAT(' | ', color, ' | ') LIKE :color")
-            params["color"] = f"% | {color_en} | %"
+            # Dataset v3: theo đúng chỉ dẫn của người xử lý dữ liệu màu
+            # (xem DOC_TRUOC.md, mục "Cập nhật chatbot của nhóm") — KHÔNG
+            # dùng phép bằng hay LIKE trên cột `color` (chuỗi ghép nhiều
+            # màu bằng " | ", không đáng tin để so khớp chuỗi con). Dùng
+            # JSON_CONTAINS trên colors_json (mảng JSON các màu chuẩn) để
+            # lọc CHÍNH XÁC sản phẩm có màu này là 1 THÀNH VIÊN trong mảng,
+            # đúng với cả sản phẩm 1 màu lẫn nhiều màu.
+            # Yêu cầu: MySQL hỗ trợ JSON_CONTAINS (MySQL >= 5.7.8) và
+            # colors_json phải là chuỗi JSON hợp lệ (kiểm tra bằng
+            # JSON_VALID sau khi import — xem DOC_TRUOC.md mục 3).
+            conditions.append("JSON_CONTAINS(colors_json, :color_json) = 1")
+            params["color_json"] = json.dumps(color_en, ensure_ascii=False)
         else:
             # Bắt buộc nhưng không dịch được -> trả 0 NGAY, không âm thầm
             # bỏ ràng buộc (khác hẳn nhánh category ở trên, xem docstring).
@@ -203,10 +206,20 @@ def rule_based_filter(
     price_range = slots.get("price_range")
     if price_range and isinstance(price_range, str) and "-" in price_range:
         try:
-            lo, hi = price_range.split("-")
+            lo_vnd, hi_vnd = price_range.split("-")
+            # QUAN TRỌNG: price_range do need_extractor.py trích xuất luôn
+            # tính theo VND (Qwen hiểu "dưới 500k" -> "0-500000" theo thói
+            # quen người Việt), NHƯNG cột `price` trong DB là USD (dữ liệu
+            # gốc Amazon, xem KET_QUA_V3.md: "Dữ liệu giá vẫn là USD.").
+            # PHẢI quy đổi VND -> USD (tỷ giá cố định, xem currency.py)
+            # trước khi đưa vào so sánh, nếu không sẽ lọc SAI HOÀN TOÀN
+            # (vd lọc "price BETWEEN 0 AND 500000" USD sẽ ra hầu như mọi
+            # sản phẩm, vì 500.000 USD là con số vô lý cho đồ gia dụng).
+            price_lo_usd = vnd_to_usd(float(lo_vnd))
+            price_hi_usd = vnd_to_usd(float(hi_vnd))
             conditions.append("price BETWEEN :price_lo AND :price_hi")
-            params["price_lo"] = float(lo)
-            params["price_hi"] = float(hi)
+            params["price_lo"] = price_lo_usd
+            params["price_hi"] = price_hi_usd
         except ValueError:
             pass  # price_range không đúng định dạng "min-max" -> bỏ qua, không lọc giá
 
@@ -239,12 +252,17 @@ def build_soft_signals(slots: Dict[str, Any], hard_constraint_slots: Set[str]) -
 
 
 def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
-    """Truy vấn giá MIN/MAX/trung vị của các sản phẩm cùng category — dùng để
-    GỢI Ý khoảng giá tham khảo cho user khi hỏi price_range, thay vì bắt user
-    tự đoán mù giá. Dùng category_mapper để dịch category tiếng Việt sang
-    leaf_category tiếng Anh thật trước khi query (cùng lỗi gốc, cùng cách
-    sửa như rule_based_filter()). Trả về None nếu chưa có category, không
-    map được leaf_category nào, hoặc lỗi DB."""
+    """Truy vấn giá MIN/MAX/trung bình (USD, đúng theo dữ liệu gốc trong DB)
+    của các sản phẩm cùng category — dùng để GỢI Ý khoảng giá tham khảo cho
+    user khi hỏi price_range, thay vì bắt user tự đoán mù giá. Dùng
+    category_mapper để dịch category tiếng Việt sang leaf_category tiếng
+    Anh thật trước khi query. Trả về None nếu chưa có category, không map
+    được leaf_category nào, hoặc lỗi DB.
+
+    Trả về CẢ 2 đơn vị: *_usd (giá trị THẬT, đúng dữ liệu gốc) và *_vnd
+    (quy đổi theo tỷ giá CỐ ĐỊNH ở currency.py, chỉ mang tính THAM KHẢO —
+    xem giải thích trong currency.py) — vì user Việt Nam nói/hiểu giá theo
+    VND, nhưng dữ liệu gốc là USD (xem rule_based_filter() để biết vì sao)."""
     if not category or not SQLALCHEMY_AVAILABLE:
         return None
 
@@ -266,7 +284,11 @@ def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
             row = conn.execute(query, params).mappings().first()
         if not row or row["min_p"] is None:
             return None
-        return {"min": float(row["min_p"]), "max": float(row["max_p"]), "avg": float(row["avg_p"])}
+        min_usd, max_usd, avg_usd = float(row["min_p"]), float(row["max_p"]), float(row["avg_p"])
+        return {
+            "min_usd": min_usd, "max_usd": max_usd, "avg_usd": avg_usd,
+            "min_vnd": usd_to_vnd(min_usd), "max_vnd": usd_to_vnd(max_usd), "avg_vnd": usd_to_vnd(avg_usd),
+        }
     except Exception as e:
         print(f"[get_price_stats] Lỗi truy vấn: {e}")
         return None
@@ -288,13 +310,15 @@ def build_action_instruction(
         stats = get_price_stats(slots.get("category"))
         if stats:
             return (
-                f"[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn. "
-                f"Sản phẩm loại này trong hệ thống dao động từ {stats['min']:,.0f}đ đến "
-                f"{stats['max']:,.0f}đ (trung bình khoảng {stats['avg']:,.0f}đ) — hãy nêu "
-                f"khoảng giá này để gợi ý cho user tham khảo, vì user có thể chưa biết "
-                f"mức giá hợp lý của loại sản phẩm này.]"
+                f"[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn (tính bằng "
+                f"VND, vì user là người Việt). Sản phẩm loại này trong hệ thống dao động khoảng "
+                f"từ {round_vnd(stats['min_vnd']):,.0f}đ đến {round_vnd(stats['max_vnd']):,.0f}đ "
+                f"(trung bình khoảng {round_vnd(stats['avg_vnd']):,.0f}đ, quy đổi theo tỷ giá tham "
+                f"khảo 1 USD = {USD_TO_VND_RATE:,}đ, không phải giá niêm yết chính thức) — hãy nêu "
+                f"khoảng giá này để gợi ý cho user tham khảo, vì user có thể chưa biết mức giá hợp "
+                f"lý của loại sản phẩm này.]"
             )
-        return "[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn.]"
+        return "[Chỉ dẫn hệ thống: hãy hỏi user về ngân sách/khoảng giá mong muốn (tính bằng VND).]"
     if action == NextAction.ASK_SOFT_SLOT and slot:
         return f"[Chỉ dẫn hệ thống: hãy hỏi user về thuộc tính '{slot}' (màu/chất liệu/phong cách/thương hiệu).]"
     if action == NextAction.SEARCH_PRODUCTS:
@@ -383,6 +407,20 @@ def chat(req: ChatRequest):
 
         soft_signals = build_soft_signals(slots, hard_constraints)
         top_products = semantic_rank(candidates, slots, extra_signals=soft_signals)
+
+        # Gắn thêm giá VND ƯỚC TÍNH (quy đổi theo tỷ giá cố định, xem
+        # currency.py) vào từng sản phẩm trả về — KHÔNG thay thế trường
+        # `price` gốc (vẫn giữ nguyên USD, đúng dữ liệu thật trong DB, để
+        # kiểm chứng/đối chiếu được). Đặt tên "_estimate" để minh bạch đây
+        # là số ước tính, không phải giá niêm yết chính thức.
+        for p in top_products:
+            raw_price = p.get("price")
+            if raw_price is not None:
+                try:
+                    p["price_vnd_estimate"] = round_vnd(usd_to_vnd(float(raw_price)))
+                except (TypeError, ValueError):
+                    pass  # giá không parse được thành số -> bỏ qua, không bịa
+
         session_manager.mark_as_shown(session.session_id, top_products)
 
     reply = generate_llm_reply(session.session_id, req.message, action, slot, top_products, session_manager.get_slots(session.session_id))

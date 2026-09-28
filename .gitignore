@@ -8,6 +8,12 @@ Dataset/
 System_ChatBox/chroma_db/
 chroma_db/
 
+# ---- Data sinh ra từ build_category_index.py — tự tạo lại được ----
+# (chỉ mục vector RIÊNG cho tên category, khác chroma_db/ ở trên — xem
+# category_mapper.py / build_category_index.py để biết vì sao tách path)
+System_ChatBox/category_index_db/
+category_index_db/
+
 # ---- Cache Python thông thường ----
 __pycache__/
 *.pyc
