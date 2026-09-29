@@ -73,8 +73,8 @@ ALLOWED_HARD_CONSTRAINT_FIELDS = ("color", "brand")
 SLOT_SCHEMA_HINT = (
     '{"category": string|null, "price_range": "min-max"|null, '
     '"color": string|null, "material": string|null, "style": string|null, '
-    '"brand": string|null, "size_space": string|null, "free_text": string|null, '
-    '"hard_constraints": ["color"|"brand", ...]}'
+    '"brand": string|null, "size_space": string|null, "product_size_text": string|null, '
+    '"free_text": string|null, "hard_constraints": ["color"|"brand", ...]}'
 )
 
 EXTRACT_SYSTEM_PROMPT = (
@@ -90,6 +90,14 @@ EXTRACT_SYSTEM_PROMPT = (
     "đích mà KHÔNG có số đo (vd 'cho phòng khách', 'làm quà tặng', 'dùng mùa đông') -> free_text. "
     "price_range chỉ điền khi user nêu rõ số tiền/khoảng giá, viết dạng 'min-max' bằng số "
     "(ví dụ user nói 'dưới 500k' -> '0-500000'; 'khoảng 200-300k' -> '200000-300000'). "
+    "QUAN TRỌNG — phân biệt size_space và product_size_text (2 khái niệm KHÁC NHAU, KHÔNG được "
+    "nhầm lẫn): size_space là số đo KHÔNG GIAN/PHÒNG nơi đặt sản phẩm (vd 'phòng khách rộng "
+    "20m2', 'góc phòng 1m2') — số đo này KHÔNG PHẢI kích thước của chính sản phẩm, chỉ dùng để "
+    "tham khảo bối cảnh, KHÔNG được dùng để lọc kích thước sản phẩm. product_size_text là số đo "
+    "CỦA CHÍNH SẢN PHẨM mà user muốn mua (vd 'tấm thảm cỡ 2m x 3m', 'thảm khoảng 150x220cm', "
+    "'đường kính 60cm') — chỉ điền khi user nói rõ đây là kích thước sản phẩm, không phải kích "
+    "thước phòng/không gian. Nếu không chắc câu nói đang chỉ kích thước sản phẩm hay không gian, "
+    "để product_size_text là null (không suy đoán), chỉ điền size_space. "
     "hard_constraints là 1 DANH SÁCH (mặc định []), CHỈ được chứa 'color' và/hoặc 'brand' — "
     "liệt kê ĐÚNG những thuộc tính mà user dùng NGÔN NGỮ RÕ RÀNG THỂ HIỆN BẮT BUỘC trong tin "
     "nhắn MỚI NHẤT (vd 'phải là', 'bắt buộc', 'chỉ lấy màu X', 'nhất định', 'không chấp nhận "
@@ -105,21 +113,31 @@ EXTRACT_SYSTEM_PROMPT = (
 # và MỚI: để phân biệt hard_constraints (bắt buộc) với ưu tiên mềm thông thường.
 EXTRACT_FEWSHOT = [
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Tôi muốn mua thảm trải sàn phòng khách"'},
-    {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "free_text": "phòng khách", "hard_constraints": []}'},
+    {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "phòng khách", "hard_constraints": []}'},
 
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Ghế sofa êm cho phòng khách rộng khoảng 20m2"'},
-    {"role": "assistant", "content": '{"category": "ghế sofa", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng khách khoảng 20m2", "free_text": null, "hard_constraints": []}'},
+    {"role": "assistant", "content": '{"category": "ghế sofa", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng khách khoảng 20m2", "product_size_text": null, "free_text": null, "hard_constraints": []}'},
 
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Mua bộ dao làm quà tặng sinh nhật bạn, tầm 300k"'},
-    {"role": "assistant", "content": '{"category": "bộ dao", "price_range": "0-300000", "color": null, "material": null, "style": null, "brand": null, "size_space": null, "free_text": "quà tặng sinh nhật", "hard_constraints": []}'},
+    {"role": "assistant", "content": '{"category": "bộ dao", "price_range": "0-300000", "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "quà tặng sinh nhật", "hard_constraints": []}'},
 
     # Ví dụ MỚI — phân biệt "ưu tiên" (mặc định, KHÔNG vào hard_constraints)
     # với "bắt buộc" (CÓ từ ngữ rõ ràng -> vào hard_constraints).
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "ghế sofa"}.\n\nTin nhắn mới của user: "Tôi ưu tiên màu xanh, nhưng không có cũng được"'},
-    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "free_text": null, "hard_constraints": []}'},
+    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": null, "hard_constraints": []}'},
 
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "ghế sofa"}.\n\nTin nhắn mới của user: "Bắt buộc phải màu xanh, thương hiệu gì cũng được"'},
-    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "free_text": null, "hard_constraints": ["color"]}'},
+    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": null, "hard_constraints": ["color"]}'},
+
+    # Ví dụ MỚI — phân biệt size_space (không gian) với product_size_text (kích thước sản phẩm).
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "thảm trải sàn"}.\n\nTin nhắn mới của user: "Tôi cần tấm thảm cỡ 2m x 3m"'},
+    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": "2m x 3m", "free_text": null, "hard_constraints": []}'},
+
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "thảm trải sàn"}.\n\nTin nhắn mới của user: "Phòng ngủ nhà mình khoảng 15m2"'},
+    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng ngủ khoảng 15m2", "product_size_text": null, "free_text": null, "hard_constraints": []}'},
+
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "thảm trải sàn"}.\n\nTin nhắn mới của user: "Phòng khách 20m2, mình muốn tấm thảm khoảng 150x220cm thôi"'},
+    {"role": "assistant", "content": '{"category": null, "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng khách 20m2", "product_size_text": "150x220cm", "free_text": null, "hard_constraints": []}'},
 ]
 
 

@@ -56,7 +56,11 @@ OPTIONAL_SOFT_SLOTS = ["color", "material", "style", "brand"]
 # Slot "chứa ngữ cảnh" — KHÔNG bao giờ được hỏi trực tiếp (không xuất hiện trong bất
 # kỳ vòng lặp ASK_HARD_SLOT/ASK_SOFT_SLOT nào), chỉ lưu lại để vector_search.py dùng
 # cho AI Matching (vd: "cho phòng khách", "làm quà tặng tân gia").
-PASSTHROUGH_SLOTS = ["free_text"]
+# product_size_text: MỚI (dataset v4, size_normalization.py) — kích thước CỦA CHÍNH SẢN
+# PHẨM (khác size_space là kích thước KHÔNG GIAN/phòng) — cũng KHÔNG chủ động hỏi (không
+# ép user phải cho số đo sản phẩm chính xác), chỉ ghi nhận khi user TỰ nói ra, dùng để
+# lọc cứng kích thước ở rule_based_filter() nếu parse được (xem main.py).
+PASSTHROUGH_SLOTS = ["free_text", "product_size_text"]
 
 ALL_SLOTS = REQUIRED_HARD_SLOTS + PRIORITY_SOFT_SLOTS + OPTIONAL_SOFT_SLOTS + PASSTHROUGH_SLOTS
 

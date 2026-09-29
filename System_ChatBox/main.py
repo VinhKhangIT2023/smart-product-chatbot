@@ -59,6 +59,7 @@ from vector_search import semantic_rank
 from category_mapper import resolve_leaf_categories
 from color_mapper import resolve_color
 from currency import usd_to_vnd, vnd_to_usd, round_vnd, USD_TO_VND_RATE
+from size_normalization import parse_size_request
 
 # MySQL (optional import — API vẫn chạy được nếu chưa cài, chỉ rule_based_filter trả rỗng)
 try:
@@ -92,6 +93,19 @@ DB_URL = (
     f"?charset=utf8mb4"
 )
 PRODUCTS_TABLE = "products"
+
+# Dung sai khi lọc kích thước sản phẩm (product_size_text) — % sai lệch cho phép mỗi
+# chiều. 0.20 là giá trị KHỞI ĐẦU lấy theo ví dụ trong tài liệu bàn giao v4 (mục 6/7),
+# CHƯA được tối ưu theo từng loại sản phẩm (tài liệu tự ghi rõ "cần chính sách theo
+# loại sản phẩm"). Nhóm nên tinh chỉnh giá trị này sau khi thử nghiệm thật.
+PRODUCT_SIZE_TOLERANCE = 0.20
+
+# MỚI — tính năng "gợi ý sản phẩm gần nhất". Các field CÓ THỂ nới lỏng khi tìm
+# kiếm chặt chẽ ra 0 kết quả (không bao giờ nới category — đổi category là đổi
+# hẳn loại sản phẩm, không còn là "gần" nữa; size_space không nằm trong danh
+# sách vì nó vốn không được dùng để lọc, xem session_manager.py).
+RELAXABLE_FIELDS = ["price_range", "product_size_text", "color", "brand"]
+MAX_NEAR_RESULTS = 5
 
 
 # ---------- Schemas ----------
@@ -203,6 +217,34 @@ def rule_based_filter(
         params["brand"] = f"%{brand_text}%"
     # brand có giá trị nhưng KHÔNG bắt buộc -> tương tự color, để tầng 2 xử lý.
 
+    # MỚI (dataset v4) — lọc kích thước SẢN PHẨM (khác size_space là kích thước
+    # KHÔNG GIAN/phòng, xem need_extractor.py để phân biệt 2 khái niệm này).
+    # Luôn lọc CỨNG khi parse được (không có cơ chế hard_constraints riêng như
+    # color/brand) — vì sai kích thước khiến sản phẩm không dùng được, hậu quả
+    # nặng hơn hẳn lệch màu/thương hiệu, nên không cần user phải nói "bắt buộc"
+    # mới lọc cứng. Đặt TRƯỚC khi build LIMIT — đúng yêu cầu tài liệu bàn giao
+    # v4 mục 7: "Không nhét bước này sau khi lấy 30 ứng viên".
+    size_text = slots.get("product_size_text")
+    if size_text:
+        size_pair = parse_size_request(size_text)
+        if size_pair:
+            dim1, dim2 = size_pair  # đã sắp giảm dần: dim1 >= dim2
+            tol = PRODUCT_SIZE_TOLERANCE
+            conditions.append("size_status = 'recognized'")
+            conditions.append("size_confidence IN ('high', 'medium')")
+            conditions.append("size_dim1_cm BETWEEN :size_d1_lo AND :size_d1_hi")
+            conditions.append("size_dim2_cm BETWEEN :size_d2_lo AND :size_d2_hi")
+            params["size_d1_lo"] = dim1 * (1 - tol)
+            params["size_d1_hi"] = dim1 * (1 + tol)
+            params["size_d2_lo"] = dim2 * (1 - tol)
+            params["size_d2_hi"] = dim2 * (1 + tol)
+        else:
+            # Không parse được (vd "cỡ vừa vừa", "trung bình") -> bỏ qua lọc
+            # kích thước ở lượt này, KHÔNG suy đoán con số — đúng nguyên tắc
+            # đã áp dụng cho category/color khi không dịch được.
+            print(f"[rule_based_filter] product_size_text='{size_text}' không parse được "
+                  f"kích thước rõ ràng -> bỏ qua lọc cứng kích thước ở lượt này.")
+
     price_range = slots.get("price_range")
     if price_range and isinstance(price_range, str) and "-" in price_range:
         try:
@@ -237,7 +279,7 @@ def rule_based_filter(
 
 
 def build_soft_signals(slots: Dict[str, Any], hard_constraint_slots: Set[str]) -> List[str]:
-    """MỚI: gom các giá trị color/brand hiện có NHƯNG KHÔNG nằm trong
+    """Gom các giá trị color/brand hiện có NHƯNG KHÔNG nằm trong
     hard_constraint_slots (tức không bị lọc cứng ở rule_based_filter) —
     dùng làm tín hiệu ưu tiên mềm truyền vào vector_search.semantic_rank(),
     để chúng vẫn ảnh hưởng tới XẾP HẠNG dù không LOẠI sản phẩm thiếu dữ liệu."""
@@ -249,6 +291,86 @@ def build_soft_signals(slots: Dict[str, Any], hard_constraint_slots: Set[str]) -
     if brand_text and "brand" not in hard_constraint_slots:
         signals.append(brand_text)
     return signals
+
+
+def describe_mismatch(field: str, slots: Dict[str, Any], product: Dict[str, Any]) -> str:
+    """Viết 1 câu NGẮN, CỤ THỂ mô tả sản phẩm `product` lệch tiêu chí `field` ra
+    sao so với yêu cầu user đã nêu trong `slots` — dùng để đưa vào chỉ dẫn cho
+    Qwen, để Qwen nói THẬT với user (không ngụ ý sản phẩm đã khớp đủ)."""
+    if field == "price_range":
+        try:
+            price_vnd = round_vnd(usd_to_vnd(float(product.get("price"))))
+            _, hi_vnd = slots["price_range"].split("-")
+            return f"giá khoảng {price_vnd:,.0f}đ, vượt ngân sách {float(hi_vnd):,.0f}đ bạn đã nêu"
+        except (TypeError, ValueError, KeyError):
+            return "giá vượt ngân sách bạn đã nêu"
+    if field == "product_size_text":
+        d1, d2 = product.get("size_dim1_cm"), product.get("size_dim2_cm")
+        if d1 and d2:
+            return f"kích thước khoảng {d1:.0f}x{d2:.0f}cm, không đúng cỡ \"{slots['product_size_text']}\" bạn muốn"
+        return f"chưa rõ kích thước, không xác nhận được có đúng cỡ \"{slots['product_size_text']}\" bạn muốn không"
+    if field == "color":
+        actual = product.get("color") or "chưa rõ màu"
+        return f"màu {actual}, không đúng màu \"{slots.get('color')}\" bạn yêu cầu"
+    if field == "brand":
+        actual = product.get("brand") or "chưa rõ thương hiệu"
+        return f"thương hiệu {actual}, không đúng thương hiệu \"{slots.get('brand')}\" bạn yêu cầu"
+    return "có 1 tiêu chí chưa khớp hoàn toàn"
+
+
+def find_near_matches(
+    slots: Dict[str, Any],
+    hard_constraint_slots: Set[str],
+    session_id: str,
+) -> List[Dict[str, Any]]:
+    """Khi tìm kiếm CHẶT CHẼ (đủ mọi điều kiện) ra 0 kết quả, thử nới LẦN LƯỢT
+    TỪNG tiêu chí một trong RELAXABLE_FIELDS (không bao giờ nới category, và
+    không bao giờ nới quá 1 tiêu chí cùng lúc — nới nhiều tiêu chí một lần sẽ
+    không còn biết chính xác sản phẩm lệch ở đâu để nói thật với user).
+
+    Mỗi sản phẩm tìm được sẽ gắn `match_type: "near"` và `near_reason` (mô tả
+    CỤ THỂ lệch gì) — KHÔNG bao giờ trộn lẫn với sản phẩm khớp đủ (những sản
+    phẩm khớp đủ thì rule_based_filter() gốc đã trả về rồi, hàm này CHỈ được
+    gọi khi kết quả gốc là rỗng)."""
+    results: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    for field in RELAXABLE_FIELDS:
+        # color/brand chỉ đáng nới nếu ĐANG là ràng buộc cứng thật sự — nếu nó
+        # đã là ưu tiên mềm từ đầu thì rule_based_filter() gốc đã không lọc
+        # cứng theo nó rồi, "nới" nó ở đây sẽ không tạo ra khác biệt gì.
+        if field in ("color", "brand"):
+            if not slots.get(field) or field not in hard_constraint_slots:
+                continue
+        else:
+            if not slots.get(field):
+                continue
+
+        relaxed_slots = dict(slots)
+        relaxed_hard = set(hard_constraint_slots)
+        if field in ("price_range", "product_size_text"):
+            relaxed_slots[field] = None
+        else:
+            relaxed_hard.discard(field)
+
+        candidates = rule_based_filter(relaxed_slots, relaxed_hard)
+        candidates = session_manager.filter_out_already_shown(session_id, candidates)
+        # Vẫn xếp hạng theo `slots` GỐC (chưa nới) — để các tiêu chí ngữ nghĩa
+        # khác (style/material/free_text/soft color-brand) vẫn được tôn trọng
+        # khi chọn sản phẩm nào "gần nhất" trong tập đã nới.
+        ranked = semantic_rank(candidates, slots, top_k=3, extra_signals=build_soft_signals(slots, hard_constraint_slots))
+
+        for p in ranked:
+            pid = p.get("product_id")
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            p["match_type"] = "near"
+            p["near_reason"] = describe_mismatch(field, slots, p)
+            results.append(p)
+
+    results.sort(key=lambda p: p.get("_similarity_score", 0), reverse=True)
+    return results[:MAX_NEAR_RESULTS]
 
 
 def get_price_stats(category: Optional[str]) -> Optional[Dict[str, float]]:
@@ -322,8 +444,43 @@ def build_action_instruction(
     if action == NextAction.ASK_SOFT_SLOT and slot:
         return f"[Chỉ dẫn hệ thống: hãy hỏi user về thuộc tính '{slot}' (màu/chất liệu/phong cách/thương hiệu).]"
     if action == NextAction.SEARCH_PRODUCTS:
-        names = ", ".join(p.get("title", "?") for p in top_products[:5]) or "(chưa có sản phẩm khớp)"
-        return f"[Chỉ dẫn hệ thống: đủ thông tin rồi, hãy gợi ý các sản phẩm sau cho user: {names}]"
+        if not top_products:
+            return ("[Chỉ dẫn hệ thống: KHÔNG tìm thấy sản phẩm nào khớp đủ điều kiện, kể cả "
+                     "gần đúng. Hãy báo rõ cho user và đề nghị điều chỉnh tiêu chí (nới ngân "
+                     "sách, đổi màu, bỏ bớt ràng buộc...). KHÔNG nói sẽ 'kiểm tra thêm' hay "
+                     "'chờ một chút' — đây đã là kết quả cuối cùng của lượt tìm kiếm này, không "
+                     "có xử lý nào chạy ngầm phía sau.]")
+
+        near = [p for p in top_products if p.get("match_type") == "near"]
+        if near:
+            # TOÀN BỘ kết quả đều là "gần nhất" (rule_based_filter gốc ra 0,
+            # find_near_matches mới tìm được) — PHẢI nói RÕ đây KHÔNG PHẢI
+            # khớp hoàn toàn, nêu cụ thể từng mẫu lệch điểm gì, để user tự
+            # quyết định có chấp nhận không, KHÔNG được ngụ ý đã đáp ứng đủ.
+            lines = "; ".join(
+                f"{p.get('title', '?')} (lệch: {p.get('near_reason', 'chưa rõ')})"
+                for p in near[:5]
+            )
+            return (
+                f"[Chỉ dẫn hệ thống: KHÔNG có sản phẩm nào khớp HOÀN TOÀN yêu cầu user đã nêu. "
+                f"Đây là các sản phẩm GẦN NHẤT tìm được, mỗi mẫu CHỈ lệch đúng 1 tiêu chí (đã "
+                f"ghi rõ lệch gì ngay sau tên): {lines}. Hãy nói RÕ RÀNG ngay từ đầu đây là gợi "
+                f"ý gần nhất chứ KHÔNG PHẢI khớp hoàn toàn, sau đó nêu CỤ THỂ từng mẫu lệch điểm "
+                f"gì (dùng đúng thông tin lệch đã cho, không tự suy thêm), để user tự quyết định "
+                f"có chấp nhận mẫu nào không hay muốn đổi tiêu chí. TUYỆT ĐỐI KHÔNG khẳng định "
+                f"các mẫu này đáp ứng đủ yêu cầu ban đầu.]"
+            )
+
+        names = ", ".join(p.get("title", "?") for p in top_products[:5])
+        return (
+            f"[Chỉ dẫn hệ thống: đây là TOÀN BỘ kết quả tìm được ở lượt này (không có thêm, "
+            f"không có xử lý nào đang chạy ngầm phía sau) — hãy giới thiệu các sản phẩm sau cho "
+            f"user: {names}. Nếu bạn thấy có điểm nào trong tên/mô tả sản phẩm có vẻ CHƯA khớp "
+            f"hoàn toàn với yêu cầu user đã nêu (vd kích thước, chất liệu), hãy NÊU RÕ điều đó để "
+            f"user tự cân nhắc có phù hợp không, thay vì lặng lẽ giới thiệu như đã khớp hoàn hảo. "
+            f"KHÔNG nói sẽ 'kiểm tra thêm' hay 'chờ một chút' — không có bước xử lý tiếp theo nào "
+            f"sẽ tự động chạy cho tới khi user nhắn tin mới.]"
+        )
     if action == NextAction.END_SESSION:
         return "[Chỉ dẫn hệ thống: user muốn kết thúc/đã chốt mua, hãy chào tạm biệt lịch sự.]"
     return ""
@@ -407,6 +564,16 @@ def chat(req: ChatRequest):
 
         soft_signals = build_soft_signals(slots, hard_constraints)
         top_products = semantic_rank(candidates, slots, extra_signals=soft_signals)
+
+        if top_products:
+            for p in top_products:
+                p["match_type"] = "exact"
+        else:
+            # MỚI — tìm kiếm chặt chẽ ra 0 kết quả: thử tìm sản phẩm GẦN NHẤT
+            # (nới từng tiêu chí một, không bao giờ nới category). Nếu vẫn
+            # không có gì, top_products giữ nguyên [] -> build_action_instruction()
+            # sẽ tự báo "không có, kể cả gần đúng" (nhánh đã có sẵn).
+            top_products = find_near_matches(slots, hard_constraints, session.session_id)
 
         # Gắn thêm giá VND ƯỚC TÍNH (quy đổi theo tỷ giá cố định, xem
         # currency.py) vào từng sản phẩm trả về — KHÔNG thay thế trường

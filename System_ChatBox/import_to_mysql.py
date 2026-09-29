@@ -60,6 +60,7 @@ except ImportError:
 
 try:
     from sqlalchemy import create_engine, text
+    from sqlalchemy.types import Float, Integer
 except ImportError:
     print("Thiếu thư viện. Chạy: pip install sqlalchemy pymysql pandas python-dotenv")
     sys.exit(1)
@@ -83,8 +84,13 @@ PRODUCTS_TABLE = "products"
 PRIMARY_KEY_COL = "product_id"   # khóa chính thật (theo CSV thật: product_id, không phải parent_asin)
 
 # Các cột thường dùng để lọc rule-based / xếp hạng — sẽ đánh index nếu
-# tồn tại trong CSV thật (kiểm tra động, không giả định cột nào chắc chắn có)
-INDEX_CANDIDATE_COLS = ["price", "leaf_category", "main_category", "brand"]
+# tồn tại trong CSV thật (kiểm tra động, không giả định cột nào chắc chắn có).
+# size_dim1_cm: MỚI (dataset v4) — main.py lọc BETWEEN theo cột này khi user
+# nêu product_size_text, nên cần index để tránh full table scan. Đây chỉ là
+# index đơn cột — tài liệu bàn giao v4 gợi ý cân nhắc index kết hợp
+# (leaf_category, size_dim1_cm) và đo EXPLAIN thật, nhóm có thể tự thêm sau
+# nếu đo thấy cần (script này chưa hỗ trợ tạo index nhiều cột).
+INDEX_CANDIDATE_COLS = ["price", "leaf_category", "main_category", "brand", "size_dim1_cm"]
 
 CREATE_SESSIONS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS conversation_sessions (
@@ -166,10 +172,28 @@ def import_catalog(csv_path: str, if_exists: str = "replace", chunksize: int = 5
         if df[col].apply(lambda v: isinstance(v, (dict, list))).any():
             df[col] = df[col].apply(lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
 
+    # MỚI (dataset v4) — ép kiểu số TƯỜNG MINH cho 2 cột kích thước, đúng yêu
+    # cầu tài liệu bàn giao v4 mục 6: "khi import pandas: ép size_dim1_cm/
+    # size_dim2_cm bằng to_numeric(errors='raise')... không nhập chuỗi rỗng
+    # thành số 0". Nếu không ép, pandas.to_sql có thể suy sai kiểu cột thành
+    # TEXT (nếu 1 lần xuất CSV sau này có ký hiệu NULL khác lẫn vào cột số),
+    # khiến các câu BETWEEN lọc kích thước trong main.py chạy sai hoặc lỗi.
+    # errors='raise' CHỦ Ý làm dừng script ngay nếu có giá trị không parse
+    # được thành số — không âm thầm biến giá trị lỗi thành NaN/0.
+    sql_dtype_overrides = {}
+    for col in ("size_dim1_cm", "size_dim2_cm"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="raise")
+            sql_dtype_overrides[col] = Float()
+    if "size_needs_review" in df.columns:
+        df["size_needs_review"] = pd.to_numeric(df["size_needs_review"], errors="raise").astype("Int64")
+        sql_dtype_overrides["size_needs_review"] = Integer()
+
     engine = get_engine()
 
     print(f"Đang tạo/ghi bảng `{PRODUCTS_TABLE}` (if_exists='{if_exists}') ...")
-    df.to_sql(PRODUCTS_TABLE, con=engine, if_exists=if_exists, index=False, chunksize=chunksize, method="multi")
+    df.to_sql(PRODUCTS_TABLE, con=engine, if_exists=if_exists, index=False, chunksize=chunksize,
+              method="multi", dtype=sql_dtype_overrides or None)
     print(f"Đã import {len(df)} sản phẩm vào bảng `{PRODUCTS_TABLE}`.")
 
     # Thêm khóa chính + index sau khi bảng đã tồn tại (to_sql không tự set PK)
