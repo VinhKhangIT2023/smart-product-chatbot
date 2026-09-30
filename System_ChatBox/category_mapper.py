@@ -27,7 +27,9 @@ map được tên, để AI Matching/free_text vẫn có cơ hội xử lý).
 """
 
 import os
-from typing import List, Optional
+import re
+import unicodedata
+from typing import Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -65,6 +67,57 @@ _warned_unavailable = False
 # phổ biến ("nồi", "thảm"...), không cần encode lại mỗi lần.
 _cache: dict = {}
 
+# --- MỚI: bảng gợi ý từ khóa tiếng Việt cho các danh từ NGẮN/MƠ HỒ mà vector
+# similarity của model đa ngôn ngữ đang dùng (paraphrase-multilingual-MiniLM-
+# L12-v2) xử lý KÉM — đã phát hiện thật qua test: "nồi"/"nồi nấu"/"nồi nấu ăn"
+# đều KHÔNG đưa "Stockpots" vào top-5, thậm chí "nồi" một mình còn khớp ra
+# "Vacuums" (máy hút bụi, hoàn toàn không liên quan).
+#
+# KHÔNG dùng cách tự động tìm chuỗi con "pot" trong leaf_category — sẽ dính
+# nhầm "Potato Mashers", "Pot Racks", "Potholders", "Potpourris" (đều chứa
+# "pot" nhưng chẳng liên quan nồi nấu). Danh sách dưới đây đã CHỌN TAY, xác
+# minh từng tên đúng là leaf_category THẬT tồn tại trong dataset v4 (đối
+# chiếu bằng script khảo sát, không đoán).
+#
+# Cơ chế: nếu category text (đã bỏ dấu) CHỨA 1 từ khóa dưới đây (khớp
+# NGUYÊN TỪ, không phải substring thô — cùng kỹ thuật word-boundary đã
+# dùng trong color_mapper.py để tránh lỗi kiểu "khong biet" khớp nhầm
+# "hồng"), GỘP THẲNG danh sách category tương ứng vào kết quả — KHÔNG phụ
+# thuộc ngưỡng min_score, vì đây là ánh xạ đã xác minh tay, tin cậy hơn
+# điểm vector. Vector search vẫn chạy thêm để bổ sung nếu thiếu, không bị
+# thay thế hoàn toàn.
+#
+# Đây là danh sách KHỞI ĐẦU, chỉ phủ từ đã phát hiện lỗi qua test — nhóm
+# nên tiếp tục bổ sung khi test thấy từ tiếng Việt khác cũng bị vector
+# search xử lý sai, giống cách color_mapper.VI_TO_EN_COLOR đã phát triển
+# dần qua thời gian.
+VI_CATEGORY_HINTS: Dict[str, List[str]] = {
+    "noi": ["Stockpots", "Pots & Pans", "Dutch Ovens", "Saucepans",
+            "Pressure Cookers", "Slow Cookers", "Rice Cookers",
+            "Multipots & Pasta Pots", "Hot Pots"],
+}
+
+_HINT_SORTED_KEYS = sorted(VI_CATEGORY_HINTS.keys(), key=len, reverse=True)
+
+
+def _normalize_vi(text: str) -> str:
+    """Bỏ dấu tiếng Việt + về chữ thường — dùng để so khớp VI_CATEGORY_HINTS
+    không phân biệt hoa/thường, không phân biệt cách gõ dấu."""
+    nfkd = unicodedata.normalize("NFKD", text.strip().lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _lookup_hints(vi_category_text: str) -> List[str]:
+    """Trả về danh sách leaf_category từ VI_CATEGORY_HINTS nếu category text
+    chứa 1 từ khóa đã biết (khớp NGUYÊN TỪ bằng \\b, không phải substring thô
+    — tránh lỗi tương tự "khong biet" khớp nhầm "hồng" đã gặp ở color_mapper).
+    Trả về [] nếu không khớp từ khóa nào."""
+    normalized = _normalize_vi(vi_category_text)
+    for key in _HINT_SORTED_KEYS:
+        if re.search(rf"\b{re.escape(key)}\b", normalized):
+            return VI_CATEGORY_HINTS[key]
+    return []
+
 
 def _lazy_init() -> bool:
     global _model, _collection, _warned_unavailable
@@ -100,8 +153,17 @@ def resolve_leaf_categories(
 ) -> List[str]:
     """Trả về danh sách leaf_category TIẾNG ANH THẬT (đã tồn tại trong DB)
     gần nghĩa nhất với `vi_category_text` (tiếng Việt, do NeedExtractor trích
-    xuất), đã lọc theo `min_score`. Trả về [] nếu chưa sẵn sàng hoặc không có
-    match nào đủ tin cậy — KHÔNG bao giờ bịa ra tên category không tồn tại."""
+    xuất). Trả về [] nếu chưa sẵn sàng hoặc không có match nào đủ tin cậy —
+    KHÔNG bao giờ bịa ra tên category không tồn tại.
+
+    THỨ TỰ ưu tiên (MỚI):
+      1. VI_CATEGORY_HINTS — bảng đã xác minh tay cho các từ mơ hồ mà vector
+         search xử lý kém (xem giải thích ở khai báo VI_CATEGORY_HINTS phía
+         trên). Nếu khớp, các category này LUÔN được đưa vào kết quả, KHÔNG
+         phụ thuộc min_score.
+      2. Vector search (như cũ) — chạy THÊM để bổ sung nếu còn thiếu, không
+         thay thế hints. Nếu index chưa sẵn sàng nhưng đã có hint khớp, vẫn
+         trả về đúng hint (không cần model)."""
     if not vi_category_text or not vi_category_text.strip():
         return []
 
@@ -109,29 +171,27 @@ def resolve_leaf_categories(
     if key in _cache:
         return _cache[key]
 
-    if not _lazy_init():
-        return []
+    matched: List[str] = list(_lookup_hints(vi_category_text))  # có thể rỗng
 
-    try:
-        query_vec = _model.encode(vi_category_text, normalize_embeddings=True)
-        result = _collection.query(
-            query_embeddings=[query_vec.tolist()],
-            n_results=top_n,
-        )
-    except Exception as e:
-        print(f"[category_mapper] Lỗi truy vấn chỉ mục category: {e}")
-        return []
-
-    ids = result.get("ids", [[]])[0]
-    # Chroma mặc định trả "distances" (khoảng cách), KHÔNG phải similarity.
-    # Với vector đã chuẩn hoá đơn vị và index cosine, cosine_similarity = 1 - cosine_distance.
-    distances = result.get("distances", [[]])[0]
-
-    matched = []
-    for cat_name, dist in zip(ids, distances):
-        similarity = 1.0 - dist
-        if similarity >= min_score:
-            matched.append(cat_name)
+    if _lazy_init():
+        try:
+            query_vec = _model.encode(vi_category_text, normalize_embeddings=True)
+            result = _collection.query(
+                query_embeddings=[query_vec.tolist()],
+                n_results=top_n,
+            )
+            ids = result.get("ids", [[]])[0]
+            # Chroma mặc định trả "distances" (khoảng cách), KHÔNG phải
+            # similarity. Với vector đã chuẩn hoá đơn vị và index cosine,
+            # cosine_similarity = 1 - cosine_distance.
+            distances = result.get("distances", [[]])[0]
+            for cat_name, dist in zip(ids, distances):
+                similarity = 1.0 - dist
+                if similarity >= min_score and cat_name not in matched:
+                    matched.append(cat_name)
+        except Exception as e:
+            print(f"[category_mapper] Lỗi truy vấn chỉ mục category: {e}")
+            # Không return [] ở đây nữa — vẫn giữ kết quả từ hints (nếu có).
 
     _cache[key] = matched
     if not matched:
@@ -142,5 +202,5 @@ def resolve_leaf_categories(
 
 if __name__ == "__main__":
     # Demo nhanh — cần đã chạy build_category_index.py trước.
-    for demo in ["thảm trải sàn", "nồi nấu", "ghế sofa", "dao làm bếp", "gối ôm"]:
+    for demo in ["thảm trải sàn", "nồi nấu", "nồi nấu ăn", "nồi", "ghế sofa", "dao làm bếp", "gối ôm"]:
         print(demo, "->", resolve_leaf_categories(demo))
