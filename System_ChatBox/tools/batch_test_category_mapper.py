@@ -4,11 +4,12 @@ Kiểm tra HÀNG LOẠT category_mapper.resolve_leaf_categories() với các dan
 tiếng Việt PHỔ BIẾN trong Home & Kitchen — chạy 1 LẦN để phát hiện nhiều lỗi
 kiểu "nồi" cùng lúc, thay vì phát hiện rải rác từng cái một qua /chat.
 
-VỊ TRÍ: file này nằm trong tools/, NHƯNG category_mapper.py (file nó cần
-import) nằm ở thư mục GỐC System_ChatBox/ (1 cấp cha) — khác thư mục nên
-`from category_mapper import ...` trực tiếp SẼ LỖI (Python không tự tìm
-lên thư mục cha). Đoạn thêm `sys.path` bên dưới xử lý đúng việc này, để
-file vẫn chạy được dù đặt trong tools/ hay gọi từ bất kỳ đâu.
+VỊ TRÍ: file này nằm trong tools/, category_mapper.py nằm trong src/ (2
+thư mục này là ANH EM, cùng nằm trong System_ChatBox/) — khác nhánh nên
+`from category_mapper import ...` hay thậm chí `from src.category_mapper
+import ...` ĐỀU sẽ lỗi nếu không thêm đúng thư mục GỐC System_ChatBox/ vào
+sys.path trước (để Python nhìn thấy "src" là 1 package con của nó). Đoạn
+sys.path bên dưới xử lý đúng việc này.
 
 CÁCH ĐỌC KẾT QUẢ (tự bạn xem, không cần gửi hết cho tôi):
   - Nếu danh sách trả về NGHE HỢP LÝ (đúng loại sản phẩm) -> bỏ qua, không
@@ -20,10 +21,8 @@ CÁCH ĐỌC KẾT QUẢ (tự bạn xem, không cần gửi hết cho tôi):
     KHÔNG LIÊN QUAN (giống ca "nồi" ra "Vacuums") -> đây mới là lỗi cần vá
     bằng VI_CATEGORY_HINTS.
 
-CHẠY (từ BẤT KỲ đâu, không bắt buộc đứng ở System_ChatBox/ nữa nhờ sys.path
-bên dưới — nhưng NHỚ: category_mapper.py cần category_index_db/ ở ĐÚNG path
-khai báo trong .env, .env lại cần đứng cùng cấp main.py để các file KHÁC
-đọc đúng -> khuyến nghị vẫn chạy từ System_ChatBox/ cho nhất quán):
+CHẠY (khuyến nghị luôn đứng tại System_ChatBox/ gốc, xem README/ghi chú
+quy tắc chạy lệnh để biết vì sao):
   python tools/batch_test_category_mapper.py
 Cần đã build_category_index.py xong (đọc category_index_db).
 """
@@ -31,12 +30,13 @@ Cần đã build_category_index.py xong (đọc category_index_db).
 import os
 import sys
 
-# MỚI — thêm thư mục CHA (System_ChatBox/) vào sys.path, vì file này giờ
-# nằm trong tools/ (1 cấp con), còn category_mapper.py ở thư mục cha.
+# MỚI — thêm thư mục GỐC System_ChatBox/ vào sys.path, để "src" (nơi chứa
+# category_mapper.py) được nhận diện là 1 package nhìn thấy được, dù file
+# này đang nằm trong tools/ (khác nhánh với src/, không phải cha-con).
 # __file__ = đường dẫn file này -> dirname 2 lần lùi về đúng System_ChatBox/.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from category_mapper import resolve_leaf_categories
+from src.category_mapper import resolve_leaf_categories
 
 # Danh sách từ phổ biến khi mua sắm Home & Kitchen — gộp từ nhiều nhóm: dụng cụ
 # bếp, đồ dùng phòng khách/ngủ, đồ trang trí, đồ vệ sinh, thiết bị điện gia dụng.

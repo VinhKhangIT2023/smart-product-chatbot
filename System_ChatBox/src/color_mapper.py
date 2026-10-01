@@ -4,7 +4,7 @@ No substring matching; negation, ambiguous/multiple-color requests need clarific
 """
 import re
 import unicodedata
-from color_normalization import normalize_color
+from src.color_normalization import normalize_color
 
 VI_TO_EN_COLOR = {
     'trắng':'White','đen':'Black','xám':'Gray','xám đậm':'Gray','xám nhạt':'Gray',

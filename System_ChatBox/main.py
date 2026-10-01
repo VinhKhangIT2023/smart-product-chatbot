@@ -52,14 +52,14 @@ try:
 except ImportError:
     pass
 
-from session_manager import SessionManager, NextAction
-from few_shot_examples import build_messages
-from need_extractor import extract_slots
-from vector_search import semantic_rank
-from category_mapper import resolve_leaf_categories
-from color_mapper import resolve_color
-from currency import usd_to_vnd, vnd_to_usd, round_vnd, USD_TO_VND_RATE
-from size_normalization import parse_size_request
+from src.session_manager import SessionManager, NextAction
+from src.few_shot_examples import build_messages
+from src.need_extractor import extract_slots
+from src.vector_search import semantic_rank
+from src.category_mapper import resolve_leaf_categories
+from src.color_mapper import resolve_color
+from src.currency import usd_to_vnd, vnd_to_usd, round_vnd, USD_TO_VND_RATE
+from src.size_normalization import parse_size_request
 
 # MySQL (optional import — API vẫn chạy được nếu chưa cài, chỉ rule_based_filter trả rỗng)
 try:

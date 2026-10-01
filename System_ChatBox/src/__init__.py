@@ -1,0 +1,1 @@
+# Biến src/ thành 1 Python package, để các câu import dạng 'from src.xxx import yyy' hoạt động đúng. File này để trống, không cần nội dung gì.
