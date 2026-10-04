@@ -34,6 +34,21 @@ chưa có cột SQL đáng tin cậy để lọc cứng theo material. "category
 dấu riêng). "price_range" luôn được lọc theo đúng khoảng user cho (đúng mô
 tả price_min/price_max trong Bảng 2.9 — không thuộc cơ chế hard_constraints
 này).
+
+--- MỚI THÊM (lần sửa này): phân biệt MÀU CỦA SẢN PHẨM vs MÀU CỦA NGỮ CẢNH ---
+Vấn đề phát hiện: few-shot trước đó dạy tốt việc tách category/free_text/
+size_space/product_size_text, nhưng CHƯA có ví dụ nào minh họa khi câu có
+thêm MÀU xen giữa category và phần ngữ cảnh không gian (vd "...phòng khách
+màu đỏ") — việc Qwen gán đúng "đỏ" cho color (thuộc tính sản phẩm) thay vì
+lẫn vào free_text trước đây chỉ dựa vào suy luận ngữ nghĩa chung, không có
+quy tắc tường minh hay ví dụ kiểm chứng. Đã thêm 1 đoạn quy tắc MÀU SẮC vào
+EXTRACT_SYSTEM_PROMPT + 2 few-shot mới xử lý đúng 2 nhánh:
+  (a) Màu mô tả SẢN PHẨM cần tìm (mặc định) -> điền color, dù câu có ngữ
+      cảnh không gian xen giữa.
+  (b) Màu mô tả KHÔNG GIAN/vật khác, không phải sản phẩm -> color=null,
+      đưa cả cụm vào free_text (KHÔNG tự suy diễn đó là màu sản phẩm).
+Không thay đổi bất kỳ quy tắc/field nào khác (size_space, product_size_text,
+hard_constraints giữ nguyên như bản đang chạy thật).
 """
 
 import json
@@ -98,6 +113,13 @@ EXTRACT_SYSTEM_PROMPT = (
     "'đường kính 60cm') — chỉ điền khi user nói rõ đây là kích thước sản phẩm, không phải kích "
     "thước phòng/không gian. Nếu không chắc câu nói đang chỉ kích thước sản phẩm hay không gian, "
     "để product_size_text là null (không suy đoán), chỉ điền size_space. "
+    "MÀU SẮC: mặc định, một cụm màu trong câu mô tả THUỘC TÍNH CỦA SẢN PHẨM đang tìm (gắn với "
+    "category) -> điền vào color, NGAY CẢ KHI câu có ngữ cảnh không gian/mục đích xen giữa category "
+    "và cụm màu (vd 'thảm trải sàn phòng khách màu đỏ' -> màu đỏ vẫn là màu của thảm, không phải "
+    "màu phòng). CHỈ để color=null và đưa cả cụm màu vào free_text khi câu nói RÕ RÀNG màu đó mô tả "
+    "một đối tượng KHÁC sản phẩm cần tìm (vd màu sơn tường, màu phòng) chứ không phải màu của sản "
+    "phẩm (vd 'phòng khách tôi sơn màu xanh, giờ cần mua thêm thảm' -> màu xanh là màu sơn phòng, "
+    "KHÔNG phải màu thảm -> color=null). Không tự suy diễn ngược lại nếu câu không nói rõ. "
     "hard_constraints là 1 DANH SÁCH (mặc định []), CHỈ được chứa 'color' và/hoặc 'brand' — "
     "liệt kê ĐÚNG những thuộc tính mà user dùng NGÔN NGỮ RÕ RÀNG THỂ HIỆN BẮT BUỘC trong tin "
     "nhắn MỚI NHẤT (vd 'phải là', 'bắt buộc', 'chỉ lấy màu X', 'nhất định', 'không chấp nhận "
@@ -110,7 +132,8 @@ EXTRACT_SYSTEM_PROMPT = (
 # Few-shot: ví dụ mẫu cụ thể input -> output JSON, giúp Qwen bắt đúng pattern
 # thay vì chỉ dựa vào mô tả trừu tượng — đặc biệt quan trọng để phân biệt
 # category/free_text/size_space qua nhiều kiểu câu đa dạng (không chỉ 1 mẫu),
-# và MỚI: để phân biệt hard_constraints (bắt buộc) với ưu tiên mềm thông thường.
+# để phân biệt hard_constraints (bắt buộc) với ưu tiên mềm thông thường, và
+# (MỚI) để phân biệt màu của sản phẩm với màu của ngữ cảnh/không gian.
 EXTRACT_FEWSHOT = [
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Tôi muốn mua thảm trải sàn phòng khách"'},
     {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "phòng khách", "hard_constraints": []}'},
@@ -121,7 +144,7 @@ EXTRACT_FEWSHOT = [
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Mua bộ dao làm quà tặng sinh nhật bạn, tầm 300k"'},
     {"role": "assistant", "content": '{"category": "bộ dao", "price_range": "0-300000", "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "quà tặng sinh nhật", "hard_constraints": []}'},
 
-    # Ví dụ MỚI — phân biệt "ưu tiên" (mặc định, KHÔNG vào hard_constraints)
+    # Ví dụ — phân biệt "ưu tiên" (mặc định, KHÔNG vào hard_constraints)
     # với "bắt buộc" (CÓ từ ngữ rõ ràng -> vào hard_constraints).
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "ghế sofa"}.\n\nTin nhắn mới của user: "Tôi ưu tiên màu xanh, nhưng không có cũng được"'},
     {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": null, "hard_constraints": []}'},
@@ -129,7 +152,7 @@ EXTRACT_FEWSHOT = [
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "ghế sofa"}.\n\nTin nhắn mới của user: "Bắt buộc phải màu xanh, thương hiệu gì cũng được"'},
     {"role": "assistant", "content": '{"category": null, "price_range": null, "color": "xanh", "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": null, "hard_constraints": ["color"]}'},
 
-    # Ví dụ MỚI — phân biệt size_space (không gian) với product_size_text (kích thước sản phẩm).
+    # Ví dụ — phân biệt size_space (không gian) với product_size_text (kích thước sản phẩm).
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "thảm trải sàn"}.\n\nTin nhắn mới của user: "Tôi cần tấm thảm cỡ 2m x 3m"'},
     {"role": "assistant", "content": '{"category": null, "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": "2m x 3m", "free_text": null, "hard_constraints": []}'},
 
@@ -138,6 +161,14 @@ EXTRACT_FEWSHOT = [
 
     {"role": "user", "content": 'Nhu cầu đã biết trước đó: {"category": "thảm trải sàn"}.\n\nTin nhắn mới của user: "Phòng khách 20m2, mình muốn tấm thảm khoảng 150x220cm thôi"'},
     {"role": "assistant", "content": '{"category": null, "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": "phòng khách 20m2", "product_size_text": "150x220cm", "free_text": null, "hard_constraints": []}'},
+
+    # --- MỚI: màu là thuộc tính SẢN PHẨM, dù câu có ngữ cảnh không gian xen giữa ---
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Tôi muốn mua thảm trải sàn phòng khách màu đỏ"'},
+    {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": "đỏ", "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "phòng khách", "hard_constraints": []}'},
+
+    # --- MỚI: màu KHÔNG phải của sản phẩm mà của 1 vật/không gian khác -> free_text, color=null ---
+    {"role": "user", "content": 'Nhu cầu đã biết trước đó: (chưa có gì).\n\nTin nhắn mới của user: "Phòng khách tôi sơn màu xanh, giờ cần mua thêm thảm trải sàn"'},
+    {"role": "assistant", "content": '{"category": "thảm trải sàn", "price_range": null, "color": null, "material": null, "style": null, "brand": null, "size_space": null, "product_size_text": null, "free_text": "phòng sơn màu xanh", "hard_constraints": []}'},
 ]
 
 
@@ -239,3 +270,10 @@ if __name__ == "__main__":
 
     result2 = extract_slots("Bắt buộc phải màu đỏ, thương hiệu Sunhouse nhé, không chấp nhận hãng khác", demo_slots)
     print("Slot trích xuất được (có hard_constraints):", result2)
+
+    # --- Test mới: phân biệt màu sản phẩm vs màu ngữ cảnh ---
+    result3 = extract_slots("Tôi muốn mua thảm trải sàn phòng khách màu đỏ", {})
+    print("Màu thuộc sản phẩm (kỳ vọng color='đỏ', free_text='phòng khách'):", result3)
+
+    result4 = extract_slots("Phòng khách tôi sơn màu xanh, giờ cần mua thêm thảm trải sàn", {})
+    print("Màu thuộc ngữ cảnh/phòng (kỳ vọng color=None, free_text có nhắc màu xanh):", result4)
